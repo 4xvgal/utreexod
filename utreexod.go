@@ -416,6 +416,32 @@ func removeRegressionDB(dbPath string) error {
 	return nil
 }
 
+// removeRegressionUtreexoState removes the utreexo accumulator and flat proof
+// index state when running the regression test network.  It is a no-op on any
+// other network.
+func removeRegressionUtreexoState() {
+	if !cfg.RegressionTest {
+		return
+	}
+
+	patterns := []string{
+		filepath.Join(cfg.DataDir, "utreexostate_*"),
+		filepath.Join(cfg.DataDir, "*_flat"),
+	}
+	for _, pattern := range patterns {
+		matches, err := filepath.Glob(pattern)
+		if err != nil {
+			continue
+		}
+		for _, path := range matches {
+			btcdLog.Infof("Removing regression test utreexo state from '%s'", path)
+			if err := os.RemoveAll(path); err != nil {
+				btcdLog.Warnf("Failed to remove '%s': %v", path, err)
+			}
+		}
+	}
+}
+
 // blockDbPath returns the path to the block database given a database type.
 func blockDbPath(dbType string) string {
 	// The database name is based on the database type.
@@ -486,6 +512,12 @@ func loadBlockDB() (database.DB, error) {
 	// The regression test is special in that it needs a clean database for
 	// each run, so remove it now if it already exists.
 	removeRegressionDB(dbPath)
+
+	// The utreexo accumulator and flat proof index persist outside the block
+	// database, so they must be reset together with it.  Otherwise the node
+	// re-applies the whole chain on top of the stale forest, duplicating
+	// leaves and corrupting every proof it serves.
+	removeRegressionUtreexoState()
 
 	btcdLog.Infof("Loading block database from '%s'", dbPath)
 	db, err := database.Open(cfg.DbType, dbPath, activeNetParams.Net)
