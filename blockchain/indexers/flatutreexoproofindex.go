@@ -1,0 +1,2086 @@
+// Copyright (c) 2021 The utreexo developers
+// Use of this source code is governed by an ISC
+// license that can be found in the LICENSE file.
+
+package indexers
+
+import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sync"
+	"time"
+
+	"github.com/btcsuite/btcd/chainhash/v2"
+	"github.com/utreexo/utreexo"
+	"github.com/utreexo/utreexod/blockchain"
+	"github.com/utreexo/utreexod/btcutil"
+	"github.com/utreexo/utreexod/chaincfg"
+	"github.com/utreexo/utreexod/database"
+	"github.com/utreexo/utreexod/wire"
+)
+
+const (
+	// flatUtreexoProofIndexName is the human-readable name for the index.
+	flatUtreexoProofIndexName = "flat utreexo proof index"
+
+	// flatUtreexoProofIndexType is the type of backend storage the flat utreexo
+	// proof index has.  This name is used as a suffix for the flat file storage
+	// directory.
+	flatUtreexoProofIndexType = "flat"
+
+	// flatUtreexoTargetName is the name given to the target data of the flat utreexo
+	// target index.  This name is used as the dataFile name in the flat files.
+	flatUtreexoTargetName = "target"
+
+	// flatUtreexoProofName is the name given to the proof data of the flat utreexo
+	// proof index.  This name is used as the dataFile name in the flat files.
+	flatUtreexoProofName = "proof"
+
+	// flatUtreexoLeafDataName is the name given to the leafdata of the flat utreexo
+	// proof index.  This name is used as the dataFile name in the flat files.
+	flatUtreexoLeafDataName = "leafdata"
+
+	// flatUtreexoUndoName is the name given to the undo data of the flat utreexo
+	// proof index.  This name is used as the dataFile name in the flat files.
+	flatUtreexoUndoName = "undo"
+
+	// flatUtreexoProofStatsName is the name given to the proof stats data of the flat
+	// utreexo proof index.  This name is used as the dataFile name in the flat
+	// files.
+	flatUtreexoProofStatsName = "utreexoproofstats"
+
+	// flatUtreexoRootsName is the name given to the roots data of the flat
+	// utreexo proof index.  This name is used as the dataFile name in the flat
+	// files.
+	flatUtreexoRootsName = "roots"
+
+	// flatTTLsName is the name given to the ttl data of the flat utreexo proof index.
+	// This name is used as the dataFile in the flat files.
+	flatTTLsName = "ttls"
+
+	// defaultProofGenInterval is the default value used to determine how often
+	// a utreexo accumulator proof should be generated.  An interval of 10 will
+	// make the proof be generated on blocks 10, 20, 30 and so on.
+	defaultProofGenInterval = 10
+
+	// ttlSize denotes how big each ttl is. It's 8 because each ttl is 2 uint32s
+	// (DeathHeight and DeathBlkIndex).
+	ttlSize = 8
+
+	// size of a uint32. Shame go std lib doesn't provide it.
+	uint32Size = 4
+)
+
+var (
+	// flatUtreexoBucketKey is the name of the flat utreexo proof
+	// index.
+	//
+	// NOTE This key is not used to store any data as we store everything in
+	// flat files for flat utreexo proof index.  It is just here to abide by the
+	// indexer interface which uses this key to determine if the indexer
+	// is resuming or not.
+	flatUtreexoBucketKey = []byte("flatutreexoparentindexkey")
+
+	// emptyUndoBlock is used as a placeholder in the undo files for when the
+	// node is not pruned. We need to place something since the undo files
+	// expect data to be written per block.
+	emptyUndoBlock, _ = serializeUndoBlock(&utreexo.Proof{}, nil)
+)
+
+// Ensure the UtreexoProofIndex type implements the Indexer interface.
+var _ Indexer = (*FlatUtreexoProofIndex)(nil)
+
+// Ensure the UtreexoProofIndex type implements the NeedsInputser interface.
+var _ NeedsInputser = (*FlatUtreexoProofIndex)(nil)
+
+// FlatUtreexoProofIndex implements a utreexo accumulator proof index for all the blocks.
+// In a flat file.
+type FlatUtreexoProofIndex struct {
+	targetState     FlatFileState
+	proofState      FlatFileState
+	leafDataState   FlatFileState
+	undoState       FlatFileState
+	proofStatsState FlatFileState
+	rootsState      FlatFileState
+	ttlState        FlatFileState
+
+	// All the configurable metadata.
+	config *UtreexoConfig
+
+	// The blockchain instance the index corresponds to.
+	chain *blockchain.BlockChain
+
+	// mtx protects concurrent access to the utreexoView .
+	mtx *sync.RWMutex
+
+	// utreexoState represents the Bitcoin UTXO set as a utreexo accumulator.
+	// It keeps all the elements of the forest in order to generate proofs.
+	utreexoState *UtreexoState
+
+	// utreexoRootsState is the accumulator for all the roots at each of the
+	// blocks. This is so that we can serve to peers the proof that a set of
+	// roots at a block is correct.
+	utreexoRootsState utreexo.Pollard
+
+	// blockTTLState is the accumulator for all the ttls at each of the blocks.
+	// Since their job is to provide proofs for the committed ttls, there's one
+	// for each block that there's a commitment for.
+	blockTTLState []utreexo.Pollard
+
+	// pStats are the proof size statistics that are kept for research purposes.
+	pStats ProofStats
+
+	// The time of when the utreexo state was last flushed.
+	lastFlushTime time.Time
+
+	// proofPipeline runs RehashAndProve in a background goroutine
+	// while the preprocess goroutine continues with Record for the next
+	// block. nil when record mode is not active.
+	proofPipeline *proofPipeline
+}
+
+// NeedsInputs signals that the index requires the referenced inputs in order
+// to properly create the index.
+//
+// This implements the NeedsInputser interface.
+func (idx *FlatUtreexoProofIndex) NeedsInputs() bool {
+	return true
+}
+
+// consistentFlatFileState rolls back all the flat file states to the tip height.
+// The data is written to the flat files directly but the index tips are cached and
+// then written to disk. This may lead to states where the index tip is lower than the
+// data stored in the flat files. Rolling back the flat file state to the index tip
+// keep ths entire indexer consistent.
+func (idx *FlatUtreexoProofIndex) consistentFlatFileState(tipHeight int32) error {
+	if !idx.config.Pruned {
+		if idx.targetState.BestHeight() != 0 &&
+			tipHeight < idx.targetState.BestHeight() {
+			bestHeight := idx.targetState.BestHeight()
+			for tipHeight != bestHeight && bestHeight > 0 {
+				err := idx.targetState.DisconnectBlock(bestHeight)
+				if err != nil {
+					return err
+				}
+				bestHeight--
+			}
+		}
+
+		if idx.proofState.BestHeight() != 0 &&
+			tipHeight < idx.proofState.BestHeight() {
+			bestHeight := idx.proofState.BestHeight()
+			for tipHeight != bestHeight && bestHeight > 0 {
+				err := idx.proofState.DisconnectBlock(bestHeight)
+				if err != nil {
+					return err
+				}
+				bestHeight--
+			}
+		}
+
+		if idx.leafDataState.BestHeight() != 0 &&
+			tipHeight < idx.leafDataState.BestHeight() {
+			bestHeight := idx.leafDataState.BestHeight()
+			for tipHeight != bestHeight && bestHeight > 0 {
+				err := idx.leafDataState.DisconnectBlock(bestHeight)
+				if err != nil {
+					return err
+				}
+				bestHeight--
+			}
+		}
+
+		if idx.ttlState.BestHeight() != 0 &&
+			tipHeight < idx.ttlState.BestHeight() {
+			bestHeight := idx.ttlState.BestHeight()
+			for tipHeight != bestHeight && bestHeight > 0 {
+				err := idx.ttlState.DisconnectBlock(bestHeight)
+				if err != nil {
+					return err
+				}
+				bestHeight--
+			}
+		}
+	}
+
+	if idx.undoState.BestHeight() != 0 &&
+		tipHeight < idx.undoState.BestHeight() {
+		bestHeight := idx.undoState.BestHeight()
+		for tipHeight != bestHeight && bestHeight > 0 {
+			err := idx.undoState.DisconnectBlock(bestHeight)
+			if err != nil {
+				return err
+			}
+			bestHeight--
+		}
+	}
+
+	if idx.proofStatsState.BestHeight() != 0 &&
+		tipHeight < idx.proofStatsState.BestHeight() {
+		bestHeight := idx.proofStatsState.BestHeight()
+		for tipHeight != bestHeight && bestHeight > 0 {
+			err := idx.proofStatsState.DisconnectBlock(bestHeight)
+			if err != nil {
+				return err
+			}
+			bestHeight--
+		}
+	}
+	if idx.rootsState.BestHeight() != 0 &&
+		tipHeight < idx.rootsState.BestHeight() {
+		bestHeight := idx.rootsState.BestHeight()
+		for tipHeight != bestHeight && bestHeight > 0 {
+			err := idx.rootsState.DisconnectBlock(bestHeight)
+			if err != nil {
+				return err
+			}
+			bestHeight--
+		}
+	}
+
+	return nil
+}
+
+// initUtreexoRootsState creates an accumulator from all the existing roots and
+// holds it in memory so that the proofs for them can be generated.
+func (idx *FlatUtreexoProofIndex) initUtreexoRootsState() error {
+	idx.utreexoRootsState = utreexo.NewAccumulator()
+
+	bestHeight := idx.rootsState.BestHeight()
+	for h := int32(0); h <= bestHeight; h++ {
+		stump, err := idx.fetchRoots(h)
+		if err != nil {
+			return err
+		}
+		bytes, err := blockchain.SerializeUtreexoRoots(stump.NumLeaves, stump.Roots)
+		if err != nil {
+			return err
+		}
+		rootHash := sha256.Sum256(bytes)
+
+		err = idx.utreexoRootsState.Modify(
+			[]utreexo.Leaf{{Hash: rootHash}}, nil, utreexo.Proof{})
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// initTTLState initializes an accumulator to the passed in height and returns it.
+// For each of the committed ttl, it checks that the ttl value is able to be calculated
+// at that height. If it's not, then the ttl is set to 0.
+func (idx *FlatUtreexoProofIndex) initTTLState(height int32) (*utreexo.Pollard, error) {
+	p := utreexo.NewAccumulator()
+
+	// Add ttl for block 0. This is so that the ttl on height 1 also has a target
+	// of 1.
+	emptyTTL := wire.UtreexoTTL{}
+	buf := bytes.NewBuffer(make([]byte, 0, emptyTTL.SerializeSize()))
+	err := emptyTTL.Serialize(buf)
+	if err != nil {
+		return nil, err
+	}
+	rootHash := sha256.Sum256(buf.Bytes())
+	err = p.Modify([]utreexo.Leaf{{Hash: rootHash}}, nil, utreexo.Proof{})
+	if err != nil {
+		return nil, err
+	}
+
+	for h := int32(1); h <= height; h++ {
+		ttls, err := idx.fetchTTLs(h)
+		if err != nil {
+			return nil, err
+		}
+
+		// If the leaf was spent after the given height, we reset it to 0
+		// as it's not spent at the height and thus doesn't have a ttl value
+		// we can use.
+		for i, ttl := range ttls {
+			if ttl.DeathHeight > uint32(height) {
+				ttls[i].DeathHeight = 0
+				ttls[i].DeathBlkIndex = 0
+			}
+		}
+
+		ttl := wire.UtreexoTTL{
+			BlockHeight: uint32(h),
+			TTLs:        ttls,
+		}
+
+		buf := bytes.NewBuffer(make([]byte, 0, ttl.SerializeSize()))
+		err = ttl.Serialize(buf)
+		if err != nil {
+			return nil, err
+		}
+		rootHash := sha256.Sum256(buf.Bytes())
+
+		err = p.Modify([]utreexo.Leaf{{Hash: rootHash}}, nil, utreexo.Proof{})
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return &p, nil
+}
+
+// Init initializes the flat utreexo proof index. This is part of the Indexer
+// interface.
+func (idx *FlatUtreexoProofIndex) Init(chain *blockchain.BlockChain,
+	tipHash *chainhash.Hash, tipHeight int32) error {
+
+	idx.chain = chain
+
+	// Init Utreexo State.
+	uState, err := InitUtreexoState(idx.config, chain, &idx.ttlState, tipHash, tipHeight)
+	if err != nil {
+		return err
+	}
+	idx.utreexoState = uState
+	idx.lastFlushTime = time.Now()
+
+	err = idx.consistentFlatFileState(tipHeight)
+	if err != nil {
+		return err
+	}
+
+	err = idx.initUtreexoRootsState()
+	if err != nil {
+		return err
+	}
+
+	err = idx.updateBlockTTLState(tipHeight)
+	if err != nil {
+		return err
+	}
+
+	// Nothing to do if we're not pruned.
+	if !idx.config.Pruned {
+		return nil
+	}
+
+	// We're here because the node is pruned.
+	//
+	// If the node is pruned, then we need to check if it started off as
+	// a pruned node or if the user switch to being a pruned node.
+	proofPath := flatFilePath(idx.config.DataDir, flatUtreexoProofName)
+	_, err = os.Stat(proofPath)
+	if err != nil {
+		// If the error isn't nil, that means the proofpath
+		// doesn't exist.
+		return nil
+	}
+
+	// Nothing to do if the best height is 0.
+	bestHeight := chain.BestSnapshot().Height
+	if bestHeight <= 0 {
+		return nil
+	}
+
+	// Make undo blocks for blocks up to 288 block from the tip. 288 since
+	// that's the basis used for NODE_NETWORK_LIMITED. Reorgs that go past
+	// that are gonna be problematic anyways.
+	undoCount := int32(288)
+
+	// The bestHeight is less than 288, then just undo all the blocks we have.
+	if undoCount > bestHeight {
+		undoCount = bestHeight
+	}
+
+	// Disconnect blocks.
+	for i := int32(0); i < undoCount; i++ {
+		height := bestHeight - i
+		err = idx.undoState.DisconnectBlock(height)
+		if err != nil {
+			return err
+		}
+	}
+
+	for height := bestHeight - (undoCount - 1); height <= bestHeight; height++ {
+		ud, err := idx.fetchUtreexoProof(height)
+		if err != nil {
+			return err
+		}
+
+		// Fetch block.
+		block, err := idx.chain.BlockByHeight(height)
+		if err != nil {
+			return err
+		}
+
+		// Generate the data for the undo block.
+		delHashes, err := idx.chain.ReconstructUData(ud, *block.Hash())
+		if err != nil {
+			return err
+		}
+
+		// Store undo block.
+		err = idx.storeUndoBlock(height, &ud.AccProof, delHashes)
+		if err != nil {
+			return err
+		}
+	}
+
+	// Remove all the proofs as we don't serve proofs as a
+	// pruned bridge node.
+	err = deleteFlatFile(proofPath)
+	if err != nil {
+		return err
+	}
+	targetPath := flatFilePath(idx.config.DataDir, flatUtreexoTargetName)
+	err = deleteFlatFile(targetPath)
+	if err != nil {
+		return err
+	}
+
+	// Delete proof stat file since it's not relevant to a pruned bridge node.
+	proofStatPath := flatFilePath(idx.config.DataDir, flatUtreexoProofStatsName)
+	err = deleteFlatFile(proofStatPath)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// Name returns the human-readable name of the index.
+//
+// This is part of the Indexer interface.
+func (idx *FlatUtreexoProofIndex) Name() string {
+	return flatUtreexoProofIndexName
+}
+
+// Key returns the database key to use for the index as a byte slice. This is
+// part of the Indexer interface.
+//
+// NOTE This key is NEVER used as we store everything in flat files
+// for flat utreexo proof index.  It is just here to abide by the
+// indexer interface.
+func (idx *FlatUtreexoProofIndex) Key() []byte {
+	return flatUtreexoBucketKey
+}
+
+// Create is invoked when the indexer manager determines the index needs
+// to be created for the first time.
+//
+// This is part of the Indexer interface.
+func (idx *FlatUtreexoProofIndex) Create(dbTx database.Tx) error {
+	_, err := dbTx.Metadata().CreateBucket(flatUtreexoBucketKey)
+	if err != nil {
+		return err
+	}
+	return nil // nothing to do
+}
+
+// ConnectBlock is invoked by the index manager when a new block has been
+// connected to the main chain.
+//
+// This is part of the Indexer interface.
+func (idx *FlatUtreexoProofIndex) ConnectBlock(dbTx database.Tx, block *btcutil.Block,
+	stxos []blockchain.SpentTxOut) error {
+
+	// Don't include genesis blocks.
+	if block.Height() == 0 {
+		log.Tracef("UtreexoProofIndex.ConnectBlock: Asked to connect genesis"+
+			" block (height %d) Ignoring request and skipping block",
+			block.Height())
+		return nil
+	}
+
+	if idx.proofPipeline != nil {
+		return idx.connectBlockRecord(dbTx, block, stxos)
+	}
+
+	_, outCount, inskip, outskip := blockchain.DedupeBlock(block)
+	dels, err := blockchain.BlockToDelLeaves(stxos, idx.chain, block, inskip)
+	if err != nil {
+		return err
+	}
+	adds := blockchain.BlockToAddLeaves(block, outskip, outCount)
+
+	idx.mtx.RLock()
+	ud, err := wire.GenerateUData(dels, idx.utreexoState.state)
+	idx.mtx.RUnlock()
+	if err != nil {
+		return err
+	}
+
+	delHashes := make([]utreexo.Hash, 0, len(ud.LeafDatas))
+	for _, ld := range ud.LeafDatas {
+		delHashes = append(delHashes, ld.LeafHash())
+	}
+	// For pruned nodes, we need to save the undo block in order to undo
+	// a block on reorgs. If we have all the proofs block by block, that
+	// data can be used for reorgs but a pruned node will not have the
+	// proofs available.
+	if idx.config.Pruned {
+		err = idx.storeUndoBlock(block.Height(), &ud.AccProof, delHashes)
+		if err != nil {
+			return err
+		}
+	} else {
+		err = idx.undoState.StoreData(block.Height(), emptyUndoBlock)
+		if err != nil {
+			return fmt.Errorf("store undoblock err. %v", err)
+		}
+	}
+
+	addHashes := make([]utreexo.Leaf, 0, len(adds))
+	for _, add := range adds {
+		addHashes = append(addHashes, utreexo.Leaf{Hash: add.LeafHash(), Remember: false})
+	}
+
+	idx.mtx.Lock()
+	createdIndexes, err := idx.utreexoState.state.ModifyAndReturnTTLs(addHashes, delHashes, ud.AccProof)
+	idx.mtx.Unlock()
+	if err != nil {
+		return err
+	}
+
+	err = idx.storeRoots(block.Height(), idx.utreexoState.state)
+	if err != nil {
+		return err
+	}
+
+	err = idx.updateRootsState()
+	if err != nil {
+		return err
+	}
+
+	// Don't store proofs if the node is pruned.
+	if idx.config.Pruned {
+		return nil
+	}
+
+	idx.pStats.UpdateTotalDelCount(uint64(len(dels)))
+	idx.pStats.UpdateUDStats(false, ud)
+
+	idx.pStats.BlockHeight = uint64(block.Height())
+	err = idx.pStats.WritePStats(&idx.proofStatsState)
+	if err != nil {
+		return err
+	}
+
+	err = idx.storeProof(block.Height(), ud)
+	if err != nil {
+		return err
+	}
+
+	err = idx.addEmptyTTLs(block.Height(), int32(len(adds)))
+	if err != nil {
+		return err
+	}
+
+	err = idx.writeTTLs(block.Height(), createdIndexes, ud.LeafDatas)
+	if err != nil {
+		return err
+	}
+
+	return idx.updateBlockTTLState(block.Height())
+}
+
+// rawBlockItem is a block + stxos sent from the main thread to the
+// preprocessing goroutine. This is the minimal data needed; all CPU-heavy
+// work (DedupeBlock, LeafHash, Record) is done off the main thread.
+type rawBlockItem struct {
+	block *btcutil.Block
+	stxos []blockchain.SpentTxOut
+}
+
+// recordItem is the unit of work handed from preprocess to the record
+// goroutine. It carries the hashed leaves needed by Forest.Record along
+// with the per-block data needed downstream.
+type recordItem struct {
+	delHashes []utreexo.Hash
+	addHashes []utreexo.Hash
+	leafDatas []wire.LeafData
+	height    int32
+	numAdds   int
+	numDels   int
+}
+
+// generateItem is the unit of work handed from record to the generate
+// goroutine. It carries the deletion positions consumed by
+// RehashAndProve along with the per-block data needed downstream
+// by store.
+type generateItem struct {
+	pendingDels    []uint64
+	leafDatas      []wire.LeafData
+	createdIndexes []int32
+	height         int32
+	numAdds        int
+	numDels        int
+}
+
+// storeItem is the unit of work handed from generate to the store
+// goroutine. It carries the outputs of RehashAndProve together
+// with the block metadata needed to write proof, roots, TTLs, and undo
+// data to disk.
+type storeItem struct {
+	roots          []utreexo.Hash
+	numLeaves      uint64
+	proof          utreexo.Proof
+	leafDatas      []wire.LeafData
+	createdIndexes []int32
+	height         int32
+	numAdds        int
+	numDels        int
+}
+
+// proofPipeline is a 4-stage pipeline for IBD proof generation.
+//
+// Four concurrent stages:
+//  1. Preprocess goroutine: DedupeBlock + BlockTo*Leaves + LeafHash → recordCh
+//  2. Record goroutine:     Forest.Record → genCh
+//  3. Generate goroutine:   RehashAndProve → storeCh
+//  4. Store goroutine:      serialize + write proof/roots/TTLs/undo to disk
+//
+// At steady state blocks N, N+1, N+2, N+3 are each in a different stage.
+// Record (stage 2) writes leaf positions in the forest.
+// RehashAndProve (stage 3) writes the parent hashes. Store
+// (stage 4) writes the proof/roots/TTL/undo flat files. Stages 2 and 3
+// serialize on the forest mutex, but stages 1 and 4 still overlap freely
+// with the forest work.
+type proofPipeline struct {
+	rawCh  chan rawBlockItem
+	errCh  chan error    // first pipeline error (capacity 1)
+	doneCh chan struct{} // closed when preprocess() exits
+}
+
+// pipelineBuffer controls how many blocks can queue between stages.
+const pipelineBuffer = 32
+
+// newProofPipeline starts the background goroutines.
+func newProofPipeline(idx *FlatUtreexoProofIndex) *proofPipeline {
+	pp := &proofPipeline{
+		rawCh:  make(chan rawBlockItem, pipelineBuffer),
+		errCh:  make(chan error, 1),
+		doneCh: make(chan struct{}),
+	}
+
+	go pp.preprocess(idx)
+	return pp
+}
+
+// preprocess is the preprocess goroutine (stage 1). It does DedupeBlock +
+// BlockTo*Leaves + LeafHash for each raw block, then hands the hashed
+// leaves off to the record goroutine. It also spawns and orchestrates the
+// record, generate, and store goroutines.
+func (pp *proofPipeline) preprocess(idx *FlatUtreexoProofIndex) {
+	defer close(pp.doneCh)
+
+	// recordCh connects preprocess → record goroutine.
+	// genCh connects record → generate goroutine.
+	// storeCh connects generate → store goroutine.
+	recordCh := make(chan recordItem, pipelineBuffer)
+	genCh := make(chan generateItem, pipelineBuffer)
+	storeCh := make(chan storeItem, pipelineBuffer)
+	recordDone := make(chan struct{})
+	genDone := make(chan struct{})
+	storeDone := make(chan struct{})
+
+	// Stage 4: store. Drains storeCh; on error, reports once and keeps
+	// draining so generate is never blocked on a full storeCh.
+	go func() {
+		defer close(storeDone)
+		var stored = true
+		for item := range storeCh {
+			if !stored {
+				continue
+			}
+			if err := idx.store(item); err != nil {
+				select {
+				case pp.errCh <- err:
+				default:
+				}
+				stored = false
+			}
+		}
+	}()
+
+	// Stage 3: generate. Drains genCh; on error, reports once and keeps
+	// draining so record is never blocked on a full genCh.
+	go func() {
+		defer close(genDone)
+		defer close(storeCh)
+		var generated = true
+		for item := range genCh {
+			if !generated {
+				continue
+			}
+			si, err := idx.generate(item)
+			if err != nil {
+				select {
+				case pp.errCh <- err:
+				default:
+				}
+				generated = false
+				continue
+			}
+			storeCh <- si
+		}
+	}()
+
+	// Stage 2: record. Drains recordCh; on error, reports once and keeps
+	// draining so preprocess is never blocked on a full recordCh.
+	go func() {
+		defer close(recordDone)
+		defer close(genCh)
+		var recorded = true
+		for item := range recordCh {
+			if !recorded {
+				continue
+			}
+			gi, err := idx.record(item)
+			if err != nil {
+				select {
+				case pp.errCh <- err:
+				default:
+				}
+				recorded = false
+				continue
+			}
+			genCh <- gi
+		}
+	}()
+
+	defer func() {
+		close(recordCh)
+		<-recordDone
+		<-genDone
+		<-storeDone
+	}()
+
+	// LeafHasher is consumed synchronously inside this stage's loop, so a
+	// single instance can be reused across blocks. The hash buffers
+	// themselves now travel through recordCh and so must be fresh per
+	// block — reusing them here would race with record's consumption.
+	lh := wire.NewLeafHasher()
+
+	for raw := range pp.rawCh {
+		// Re-post any pipeline error so the caller sees it, then exit.
+		select {
+		case err := <-pp.errCh:
+			select {
+			case pp.errCh <- err:
+			default:
+			}
+			return
+		default:
+		}
+
+		height := raw.block.Height()
+		_, outCount, inskip, outskip := blockchain.DedupeBlock(raw.block)
+		dels, err := blockchain.BlockToDelLeaves(raw.stxos, idx.chain, raw.block, inskip)
+		if err != nil {
+			select {
+			case pp.errCh <- fmt.Errorf("BlockToDelLeaves at height %d: %w",
+				height, err):
+			default:
+			}
+			return
+		}
+		adds := blockchain.BlockToAddLeaves(raw.block, outskip, outCount)
+
+		// Release block and stxos early so GC can collect the large
+		// deserialized transaction data while we hash and record.
+		raw.block = nil
+		raw.stxos = nil
+
+		delHashes := make([]utreexo.Hash, len(dels))
+		addHashes := make([]utreexo.Hash, len(adds))
+		for i := range dels {
+			delHashes[i] = lh.HashLeaf(&dels[i])
+		}
+		for i := range adds {
+			addHashes[i] = lh.HashLeaf(&adds[i])
+		}
+
+		recordCh <- recordItem{
+			delHashes: delHashes,
+			addHashes: addHashes,
+			leafDatas: dels,
+			height:    height,
+			numAdds:   len(adds),
+			numDels:   len(dels),
+		}
+	}
+}
+
+// stop stops the background goroutines by closing rawCh and waiting for
+// the preprocess goroutine (and the record + generate + store goroutines
+// it owns) to drain and exit.
+func (pp *proofPipeline) stop() {
+	close(pp.rawCh)
+	<-pp.doneCh
+}
+
+// stopAndCheck stops the pipeline, waits for all queued work to drain, and
+// returns the first error any stage reported.
+func (pp *proofPipeline) stopAndCheck() error {
+	pp.stop()
+	select {
+	case err := <-pp.errCh:
+		return err
+	default:
+		return nil
+	}
+}
+
+// record runs Forest.Record for the prepared block and returns a
+// generateItem carrying the deletion positions that RehashAndProve
+// will consume. Runs in the record goroutine, concurrent with the next
+// block's prepare (stage 1) and the previous block's disk writes (stage 4).
+func (idx *FlatUtreexoProofIndex) record(item recordItem) (generateItem, error) {
+	createdIndexes, delPositions, err := idx.utreexoState.state.Record(item.addHashes, item.delHashes)
+	if err != nil {
+		return generateItem{}, fmt.Errorf("Record at height %d: %w", item.height, err)
+	}
+	return generateItem{
+		pendingDels:    delPositions,
+		leafDatas:      item.leafDatas,
+		createdIndexes: createdIndexes,
+		height:         item.height,
+		numAdds:        item.numAdds,
+		numDels:        item.numDels,
+	}, nil
+}
+
+// generate runs RehashAndProve for the recorded block and returns
+// a storeItem carrying the outputs. Runs in the generate goroutine,
+// concurrent with the previous block's disk writes (stage 4).
+func (idx *FlatUtreexoProofIndex) generate(item generateItem) (storeItem, error) {
+	roots, numLeaves, proof, err := idx.utreexoState.state.RehashAndProve(item.pendingDels)
+	if err != nil {
+		return storeItem{}, fmt.Errorf("RehashAndProve at height %d: %w", item.height, err)
+	}
+	return storeItem{
+		roots:          roots,
+		numLeaves:      numLeaves,
+		proof:          proof,
+		leafDatas:      item.leafDatas,
+		createdIndexes: item.createdIndexes,
+		height:         item.height,
+		numAdds:        item.numAdds,
+		numDels:        item.numDels,
+	}, nil
+}
+
+// store serializes and writes proof, roots, TTLs, and undo data to flat
+// files for a fully-generated block. Runs in the store goroutine,
+// concurrent with the next block's RehashAndProve (stage 3).
+func (idx *FlatUtreexoProofIndex) store(item storeItem) error {
+	if err := idx.undoState.StoreData(item.height, emptyUndoBlock); err != nil {
+		return fmt.Errorf("store undoblock at height %d: %w", item.height, err)
+	}
+	if err := idx.addEmptyTTLs(item.height, int32(item.numAdds)); err != nil {
+		return err
+	}
+	if err := idx.writeTTLs(item.height, item.createdIndexes, item.leafDatas); err != nil {
+		return err
+	}
+	if err := idx.updateBlockTTLState(item.height); err != nil {
+		return err
+	}
+
+	serialized, err := blockchain.SerializeUtreexoRoots(item.numLeaves, item.roots)
+	if err != nil {
+		return err
+	}
+	if err := idx.rootsState.StoreData(item.height, serialized); err != nil {
+		return fmt.Errorf("store roots at height %d: %w", item.height, err)
+	}
+
+	if !idx.config.Pruned && item.numDels > 0 {
+		ud := &wire.UData{
+			AccProof:  item.proof,
+			LeafDatas: item.leafDatas,
+		}
+		if err := idx.storeProof(item.height, ud); err != nil {
+			return err
+		}
+		idx.pStats.UpdateTotalDelCount(uint64(item.numDels))
+		idx.pStats.UpdateUDStats(false, ud)
+		idx.pStats.BlockHeight = uint64(item.height)
+		if err := idx.pStats.WritePStats(&idx.proofStatsState); err != nil {
+			return err
+		}
+	} else if !idx.config.Pruned {
+		emptyUD := &wire.UData{AccProof: utreexo.Proof{}}
+		if err := idx.storeProof(item.height, emptyUD); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// StartProofPipeline enables record mode with background proof generation.
+// ConnectBlock will use Forest.Record (fast, no hashing) and send proof
+// generation work to a background goroutine that calls RehashAndProve
+// concurrently with the next block's Record.
+//
+// Call StopProofPipeline when done (e.g., after IBD) to drain pending
+// work and exit record mode.
+func (idx *FlatUtreexoProofIndex) StartProofPipeline() error {
+	if err := idx.utreexoState.state.EnterRecordMode(); err != nil {
+		return fmt.Errorf("EnterRecordMode: %w", err)
+	}
+	idx.proofPipeline = newProofPipeline(idx)
+	return nil
+}
+
+// connectBlockRecord is the fast path for ConnectBlock when the proof
+// pipeline is active. It sends the raw block to the preprocessing
+// goroutine, which handles all CPU-heavy work (DedupeBlock, LeafHash,
+// Record) off the main thread. The main thread does near-zero work,
+// allowing block loading to fully overlap with the pipeline.
+func (idx *FlatUtreexoProofIndex) connectBlockRecord(_ database.Tx, block *btcutil.Block,
+	stxos []blockchain.SpentTxOut) error {
+
+	// Non-blocking check for pipeline errors.
+	select {
+	case err := <-idx.proofPipeline.errCh:
+		return fmt.Errorf("proof pipeline error: %w", err)
+	default:
+	}
+
+	// Send raw block to preprocessing goroutine. Select on doneCh so a
+	// preprocess goroutine that has already exited on its own error does
+	// not leave this send blocked forever on a full rawCh. In that case
+	// surface the pipeline error instead of hanging.
+	select {
+	case idx.proofPipeline.rawCh <- rawBlockItem{block: block, stxos: stxos}:
+	case <-idx.proofPipeline.doneCh:
+		select {
+		case err := <-idx.proofPipeline.errCh:
+			return fmt.Errorf("proof pipeline error: %w", err)
+		default:
+			return fmt.Errorf("proof pipeline stopped unexpectedly")
+		}
+	}
+	return nil
+}
+
+// StopProofPipeline drains any pending proof work, exits record mode, and
+// stops the background goroutines. After this call, ConnectBlock resumes
+// using the normal Modify + Prove path.
+func (idx *FlatUtreexoProofIndex) StopProofPipeline() error {
+	if idx.proofPipeline == nil {
+		return nil
+	}
+
+	// Stop the pipeline and wait for it to drain all queued work. By the
+	// time the drain returns, the generate and store goroutines have
+	// finished RehashAndProve and disk writes for every block, so
+	// all intermediate hashes are persisted and the accumulator is fully
+	// built up.
+	err := idx.proofPipeline.stopAndCheck()
+	idx.proofPipeline = nil
+	if err != nil {
+		return fmt.Errorf("proof pipeline error: %w", err)
+	}
+
+	if err := idx.utreexoState.state.ExitRecordMode(); err != nil {
+		return fmt.Errorf("ExitRecordMode: %w", err)
+	}
+
+	log.Infof("Proof pipeline stopped: %d leaves, %d roots",
+		idx.utreexoState.state.GetNumLeaves(),
+		len(idx.utreexoState.state.GetRoots()))
+
+	return nil
+}
+
+// drainProofPipeline waits for every block already handed to the proof
+// pipeline to be recorded, rehashed, and stored, then restarts the pipeline
+// goroutines so ConnectBlock can keep feeding blocks. Flush calls this
+// before committing: the WAL commit is labeled with a block hash, and crash
+// recovery replays the blocks after that label on top of the committed
+// state, so the committed state must be exactly the post-block state of the
+// label. While the pipeline is mid-flight it runs tens of blocks behind.
+// On a pipeline error the pipeline is torn down and the error returned. The
+// forest must not be flushed in that case since its state stops short of
+// any label the caller could supply.
+func (idx *FlatUtreexoProofIndex) drainProofPipeline() error {
+	if idx.proofPipeline == nil {
+		return nil
+	}
+	if err := idx.proofPipeline.stopAndCheck(); err != nil {
+		idx.proofPipeline = nil
+		return fmt.Errorf("proof pipeline error: %w", err)
+	}
+	idx.proofPipeline = newProofPipeline(idx)
+	return nil
+}
+
+// calcProofOverhead calculates the overhead of the current utreexo accumulator proof
+// has.
+func calcProofOverhead(ud *wire.UData) float64 {
+	if ud == nil || len(ud.AccProof.Targets) == 0 {
+		return 0
+	}
+
+	return float64(len(ud.AccProof.Proof)) / float64(len(ud.AccProof.Targets))
+}
+
+// attachBlock attaches the passed in block to the utreexo accumulator state.
+func (idx *FlatUtreexoProofIndex) attachBlock(blk *btcutil.Block, stxos []blockchain.SpentTxOut) error {
+	_, outCount, inskip, outskip := blockchain.DedupeBlock(blk)
+	dels, err := blockchain.BlockToDelLeaves(stxos, idx.chain, blk, inskip)
+	if err != nil {
+		return err
+	}
+
+	adds := blockchain.BlockToAddLeaves(blk, outskip, outCount)
+	ud, err := wire.GenerateUData(dels, idx.utreexoState.state)
+	if err != nil {
+		return err
+	}
+
+	delHashes := make([]utreexo.Hash, len(dels))
+	for i, del := range dels {
+		delHashes[i] = del.LeafHash()
+	}
+
+	addHashes := make([]utreexo.Leaf, 0, len(adds))
+	for _, add := range adds {
+		addHashes = append(addHashes, utreexo.Leaf{Hash: add.LeafHash(), Remember: false})
+	}
+	err = idx.utreexoState.state.Modify(addHashes, delHashes, ud.AccProof)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// resyncUtreexoState fetches blocks from start to finish-1 and attaches all the fetched
+// blocks to the utreexo accumulator state.
+func (idx *FlatUtreexoProofIndex) resyncUtreexoState(start, finish int32) error {
+	for h := start; h < finish; h++ {
+		if h == 0 {
+			// nothing to do for genesis blocks.
+			continue
+		}
+
+		blk, err := idx.chain.BlockByHeight(h)
+		if err != nil {
+			return err
+		}
+
+		stxos, err := idx.chain.FetchSpendJournalUnsafe(blk)
+		if err != nil {
+			return err
+		}
+
+		err = idx.attachBlock(blk, stxos)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// printHashes returns the hashes encoded to string.
+func printHashes(hashes []utreexo.Hash) string {
+	str := ""
+	for i, hash := range hashes {
+		str += " " + hex.EncodeToString(hash[:])
+
+		if i != len(hashes)-1 {
+			str += "\n"
+		}
+	}
+
+	return str
+}
+
+// getUndoData returns the data needed for undo. For pruned nodes, we fetch the data from the undo block.
+// For archive nodes, we generate the data from the proof.
+func (idx *FlatUtreexoProofIndex) getUndoData(block *btcutil.Block) (
+	[]utreexo.Hash, *utreexo.Proof, []utreexo.Hash, *wire.UData, error) {
+
+	var (
+		addHashes []utreexo.Hash
+		proof     *utreexo.Proof
+		delHashes []utreexo.Hash
+		ud        *wire.UData
+	)
+
+	if !idx.config.Pruned {
+		var err error
+		ud, err = idx.FetchUtreexoProof(block.Height())
+		if err != nil {
+			return nil, nil, nil, nil, err
+		}
+
+		proof = &ud.AccProof
+
+		// Need to call reconstruct since the saved utreexo data is in the compact form.
+		delHashes, err = idx.chain.ReconstructUData(ud, *block.Hash())
+		if err != nil {
+			return nil, nil, nil, nil, err
+		}
+	} else {
+		var err error
+		proof, delHashes, err = idx.fetchUndoBlock(block.Height())
+		if err != nil {
+			return nil, nil, nil, nil, err
+		}
+	}
+
+	_, outCount, _, outskip := blockchain.DedupeBlock(block)
+	adds := blockchain.BlockToAddLeaves(block, outskip, outCount)
+	for _, add := range adds {
+		addHashes = append(addHashes, add.LeafHash())
+	}
+
+	return addHashes, proof, delHashes, ud, nil
+}
+
+// getCreateIndexes returns the indexes within the newly created leaves that the delhashes were at.
+func (idx *FlatUtreexoProofIndex) getCreateIndexes(lds []wire.LeafData, delHashes []utreexo.Hash) ([]int32, error) {
+	createIndexes := make([]int32, 0, len(lds))
+	for i, ld := range lds {
+		stxoBlock, err := idx.chain.BlockByHeight(ld.Height)
+		if err != nil {
+			return nil, err
+		}
+
+		_, outCount, _, outskip := blockchain.DedupeBlock(stxoBlock)
+		adds := blockchain.BlockToAddLeaves(stxoBlock, outskip, outCount)
+		for j, add := range adds {
+			if add.LeafHash() == delHashes[i] {
+				createIndexes = append(createIndexes, int32(j))
+				break
+			}
+		}
+	}
+
+	return createIndexes, nil
+}
+
+// DisconnectBlock is invoked by the index manager when a new block has been
+// disconnected to the main chain.
+//
+// This is part of the Indexer interface.
+func (idx *FlatUtreexoProofIndex) DisconnectBlock(dbTx database.Tx, block *btcutil.Block,
+	stxos []blockchain.SpentTxOut) error {
+
+	state, err := idx.fetchRoots(block.Height() - 1)
+	if err != nil {
+		return err
+	}
+
+	addHashes, proof, delHashes, ud, err := idx.getUndoData(block)
+	if err != nil {
+		return err
+	}
+
+	if !idx.config.Pruned {
+		createIndexes, err := idx.getCreateIndexes(ud.LeafDatas, delHashes)
+		if err != nil {
+			return err
+		}
+
+		err = idx.resetTTLs(ud, createIndexes)
+		if err != nil {
+			return err
+		}
+	}
+
+	idx.mtx.Lock()
+	err = idx.utreexoState.state.Undo(addHashes, *proof, delHashes, state.Roots)
+	idx.mtx.Unlock()
+	if err != nil {
+		return err
+	}
+
+	// Always flush the utreexo state on flushes to never leave the utreexoState
+	// at an unrecoverable state.
+	err = idx.flushUtreexoState(&block.MsgBlock().Header.PrevBlock)
+	if err != nil {
+		return err
+	}
+
+	// Check if we're at a height where proof was generated. Only check if we're not
+	// pruned as we don't keep the historical proofs as a pruned node.
+	if !idx.config.Pruned {
+		err = idx.targetState.DisconnectBlock(block.Height())
+		if err != nil {
+			return err
+		}
+
+		err = idx.proofState.DisconnectBlock(block.Height())
+		if err != nil {
+			return err
+		}
+
+		err = idx.ttlState.DisconnectBlock(block.Height())
+		if err != nil {
+			return err
+		}
+
+		err = idx.leafDataState.DisconnectBlock(block.Height())
+		if err != nil {
+			return err
+		}
+	}
+
+	err = idx.undoState.DisconnectBlock(block.Height())
+	if err != nil {
+		return err
+	}
+
+	err = idx.rootsState.DisconnectBlock(block.Height())
+	if err != nil {
+		return err
+	}
+
+	// Re-initializes to the current accumulator roots, effectively disconnecting
+	// a block.
+	return idx.initUtreexoRootsState()
+}
+
+// PruneBlock is invoked when an older block is deleted after it's been
+// processed.
+//
+// This is part of the Indexer interface.
+func (idx *FlatUtreexoProofIndex) PruneBlock(_ database.Tx, _ *chainhash.Hash, lastKeptHeight int32) error {
+	consistencyHash, err := idx.utreexoState.state.ReadConsistencyHash()
+	if err != nil {
+		return err
+	}
+
+	// If there's a saved consistency hash, check if a flush is actually needed.
+	if consistencyHash != [32]byte{} {
+		hash := chainhash.Hash(consistencyHash)
+
+		// It's ok to call block by hash here as the utreexo state consistency hash is always
+		// included in the best chain.
+		lastFlushHeight, err := idx.chain.BlockHeightByHash(&hash)
+		if err != nil {
+			return err
+		}
+
+		// If the last flushed utreexo state is the last or greater than the kept block,
+		// we can sync up to the tip so a flush is not required.
+		if lastKeptHeight <= lastFlushHeight {
+			return nil
+		}
+	}
+
+	// It's ok to fetch the best snapshot here as the block called on pruneblock has not
+	// been yet connected yet on the utreexo state. So this is indeed the correct hash.
+	bestHash := idx.chain.BestSnapshot().Hash
+	return idx.Flush(&bestHash, blockchain.FlushRequired, true)
+}
+
+// FetchUtreexoProof returns the Utreexo proof data for the given block height.
+func (idx *FlatUtreexoProofIndex) FetchUtreexoProof(height int32) (
+	*wire.UData, error) {
+
+	if height == 0 {
+		return &wire.UData{}, nil
+	}
+
+	if idx.config.Pruned {
+		return nil, fmt.Errorf("Cannot fetch historical proof as the node is pruned")
+	}
+
+	return idx.fetchUtreexoProof(height)
+}
+
+// fetchUtreexoProof returns the Utreexo proof data for the given block height.
+// Returns an error if it couldn't fetch the proof.
+func (idx *FlatUtreexoProofIndex) fetchUtreexoProof(height int32) (
+	*wire.UData, error) {
+
+	targets, err := idx.fetchTargets(height)
+	if err != nil {
+		return nil, err
+	}
+
+	leafDatas, err := idx.fetchLeafDatas(height)
+	if err != nil {
+		return nil, err
+	}
+
+	proofHashes, err := idx.fetchProofHashes(height)
+	if err != nil {
+		return nil, err
+	}
+
+	ud := wire.UData{
+		AccProof: utreexo.Proof{
+			Targets: targets,
+			Proof:   proofHashes,
+		},
+		LeafDatas: leafDatas,
+	}
+
+	return &ud, nil
+}
+
+// fetchTargets fetches the targets at the given height. Returns an error if it couldn't
+// fetch it.
+func (idx *FlatUtreexoProofIndex) fetchTargets(height int32) ([]uint64, error) {
+	targetBytes, err := idx.targetState.FetchData(height)
+	if err != nil {
+		return nil, err
+	}
+	if targetBytes == nil {
+		return nil, fmt.Errorf("Couldn't fetch targets for height %d", height)
+	}
+	r := bytes.NewReader(targetBytes)
+
+	return wire.ProofTargetsDeserialize(r)
+}
+
+// fetchLeafDatas fetches the leafdatas at the given height. Returns an error if it couldn't
+// fetch it.
+func (idx *FlatUtreexoProofIndex) fetchLeafDatas(height int32) ([]wire.LeafData, error) {
+	leafDataBytes, err := idx.leafDataState.FetchData(height)
+	if err != nil {
+		return nil, err
+	}
+	if leafDataBytes == nil {
+		return nil, fmt.Errorf("Couldn't fetch leafDatas for height %d", height)
+	}
+	r := bytes.NewReader(leafDataBytes)
+
+	return wire.DeserializeUtxoData(r)
+}
+
+// fetchProofHashes fetches the proof hashes at the given height. Returns an error if it
+// couldn't fetch it.
+func (idx *FlatUtreexoProofIndex) fetchProofHashes(height int32) ([]utreexo.Hash, error) {
+	proofHashesBytes, err := idx.proofState.FetchData(height)
+	if err != nil {
+		return nil, err
+	}
+	if proofHashesBytes == nil {
+		return nil, fmt.Errorf("Couldn't fetch proofHashess for height %d", height)
+	}
+	r := bytes.NewReader(proofHashesBytes)
+
+	return wire.ProofHashesDeserialize(r)
+}
+
+// GetLeafHashPositions returns the positions of the passed in hashes.
+func (idx *FlatUtreexoProofIndex) GetLeafHashPositions(delHashes []utreexo.Hash) []uint64 {
+	idx.mtx.RLock()
+	defer idx.mtx.RUnlock()
+
+	positions := make([]uint64, len(delHashes))
+	for i, delHash := range delHashes {
+		pos, _ := idx.utreexoState.state.GetLeafPosition(delHash)
+		positions[i] = pos
+	}
+
+	return positions
+}
+
+// GenerateUDataPartial generates a utreexo data based on the current state of the accumulator.
+// It leaves out the full proof hashes and only fetches the requested positions.
+func (idx *FlatUtreexoProofIndex) GenerateUDataPartial(dels []wire.LeafData, positions []uint64) (*wire.UData, error) {
+	idx.mtx.RLock()
+	defer idx.mtx.RUnlock()
+
+	ud := new(wire.UData)
+	ud.LeafDatas = dels
+
+	delHashes := make([]utreexo.Hash, 0, len(dels))
+	for _, del := range dels {
+		// We can't calculate the correct hash if the leaf data is in
+		// the compact state.
+		if !del.IsUnconfirmed() {
+			delHashes = append(delHashes, del.LeafHash())
+		}
+	}
+
+	hashes := make([]utreexo.Hash, len(positions))
+	for i, pos := range positions {
+		hashes[i] = idx.utreexoState.state.GetHash(pos)
+	}
+
+	targets := make([]uint64, len(delHashes))
+	for i, delHash := range delHashes {
+		pos, found := idx.utreexoState.state.GetLeafPosition(delHash)
+		if found {
+			targets[i] = pos
+		}
+	}
+
+	ud.AccProof = utreexo.Proof{
+		Targets: targets,
+		Proof:   hashes,
+	}
+
+	return ud, nil
+}
+
+// getPollard returns the pollard in the flatutreexoproofindex with the matching
+// version. Returns nil if the version is not there.
+func (idx *FlatUtreexoProofIndex) getPollard(version uint32) *utreexo.Pollard {
+	var p *utreexo.Pollard
+	for _, ttlState := range idx.blockTTLState {
+		if ttlState.NumLeaves == uint64(version) {
+			p = &ttlState
+		}
+	}
+
+	return p
+}
+
+// FetchTTLs fetches the ttls as a MsgUtreexoTTLs from the given data.
+func (idx *FlatUtreexoProofIndex) FetchTTLs(version, startHeight uint32, exponent uint8) (
+	wire.MsgUtreexoTTLs, error) {
+
+	p := idx.getPollard(version)
+	if p == nil {
+		return wire.MsgUtreexoTTLs{}, fmt.Errorf("version %v doesn't exist", version)
+	}
+
+	heights, err := wire.GetUtreexoTTLHeights(
+		int32(startHeight), int32(version), exponent)
+	if err != nil {
+		return wire.MsgUtreexoTTLs{}, err
+	}
+
+	msg := wire.MsgUtreexoTTLs{
+		TTLs: make([]wire.UtreexoTTL, 0, len(heights)),
+	}
+
+	// Version is the count of heights so we need to do -1 to get the endHeight.
+	endHeight := version - 1
+
+	leafHashes := make([]utreexo.Hash, 0, len(heights))
+	for _, height := range heights {
+		ttls, err := idx.fetchTTLs(height)
+		if err != nil {
+			return wire.MsgUtreexoTTLs{}, err
+		}
+
+		// Remove the ttls that were added after the commitment.
+		for i, ttl := range ttls {
+			if ttl.DeathHeight > endHeight {
+				ttls[i].DeathHeight = 0
+				ttls[i].DeathBlkIndex = 0
+			}
+		}
+
+		ttl := wire.UtreexoTTL{
+			BlockHeight: uint32(height),
+			TTLs:        ttls,
+		}
+		msg.TTLs = append(msg.TTLs, ttl)
+
+		buf := bytes.NewBuffer(make([]byte, 0, ttl.SerializeSize()))
+		err = ttl.Serialize(buf)
+		if err != nil {
+			return wire.MsgUtreexoTTLs{}, err
+		}
+		leafHashes = append(leafHashes, sha256.Sum256(buf.Bytes()))
+	}
+
+	proof, err := p.Prove(leafHashes)
+	if err != nil {
+		return wire.MsgUtreexoTTLs{}, err
+	}
+	msg.ProofHashes = proof.Proof
+
+	return msg, nil
+}
+
+// fetchTTLs fetches the ttls at the given height.
+func (idx *FlatUtreexoProofIndex) fetchTTLs(height int32) (
+	[]wire.TTLInfo, error) {
+
+	if height == 0 {
+		return nil, nil
+	}
+
+	if idx.config.Pruned {
+		return nil, fmt.Errorf("Cannot fetch ttl data as the node is pruned")
+	}
+
+	ttlBytes, err := idx.ttlState.FetchData(height)
+	if err != nil {
+		return nil, err
+	}
+	if ttlBytes == nil {
+		return nil, fmt.Errorf("Couldn't fetch ttl data for height %d", height)
+	}
+
+	ttls := make([]wire.TTLInfo, len(ttlBytes)/ttlSize)
+	for i := range ttls {
+		start := i * ttlSize
+		ttls[i].DeathHeight = byteOrder.Uint32(ttlBytes[start : start+uint32Size])
+		ttls[i].DeathBlkIndex = byteOrder.Uint32(ttlBytes[start+uint32Size : start+ttlSize])
+	}
+
+	return ttls, nil
+}
+
+// resetTTLs is used during reorganizations when stxos are turned about into utxos. The ttls
+// at the given heights and indexes are marked as unspent.
+func (idx *FlatUtreexoProofIndex) resetTTLs(ud *wire.UData, createdIndexes []int32) error {
+	if len(ud.LeafDatas) == 0 {
+		return nil
+	}
+
+	buf := [ttlSize]byte{}
+	for i, ld := range ud.LeafDatas {
+		cIndex := createdIndexes[i]
+		offset := cIndex * ttlSize
+		err := idx.ttlState.OverWrite(ld.Height, offset, buf[:])
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// writeTTLs writes the ttls at the given heights and indexes.
+func writeTTLs(curHeight int32, createdIndexes []int32, lds []wire.LeafData,
+	ttlIdx *FlatFileState) error {
+
+	// Nothing to do.
+	if ttlIdx == nil || len(lds) == 0 {
+		return nil
+	}
+	buf := [ttlSize]byte{}
+
+	// Take the lock once for all writes instead of per-write.
+	ttlIdx.mtx.Lock()
+	defer ttlIdx.mtx.Unlock()
+
+	for i, ld := range lds {
+		byteOrder.PutUint32(buf[:uint32Size], uint32(curHeight))
+		byteOrder.PutUint32(buf[uint32Size:ttlSize], uint32(i))
+
+		cIndex := createdIndexes[i]
+		offset := cIndex * ttlSize
+
+		err := ttlIdx.overwriteLocked(ld.Height, offset, buf[:])
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// writeTTLs is a wrapper on raw writeTTLs.
+func (idx *FlatUtreexoProofIndex) writeTTLs(
+	curHeight int32, createdIndexes []int32, lds []wire.LeafData) error {
+
+	return writeTTLs(curHeight, createdIndexes, lds, &idx.ttlState)
+}
+
+// addEmptyTTLs adds slots for every newly created leaf so that they may be marked in the future when they're spent.
+func (idx *FlatUtreexoProofIndex) addEmptyTTLs(height, numAdds int32) error {
+	buf := make([]byte, numAdds*ttlSize)
+	err := idx.ttlState.StoreData(height, buf)
+	if err != nil {
+		return fmt.Errorf("store ttl err. %v", err)
+	}
+
+	return nil
+}
+
+// storeProof serializes and stores the utreexo data in the proof state.
+func (idx *FlatUtreexoProofIndex) storeProof(height int32, ud *wire.UData) error {
+	// One buffer serves all three writes. Each StoreData copies the bytes
+	// before the next serialization reuses the buffer, so no scratch is
+	// shared across calls or instances.
+	var buf bytes.Buffer
+
+	buf.Grow(wire.BatchProofSerializeAccProofSize(&ud.AccProof))
+	if err := wire.ProofHashesSerialize(&buf, ud.AccProof.Proof); err != nil {
+		return err
+	}
+	if err := idx.proofState.StoreData(height, buf.Bytes()); err != nil {
+		return fmt.Errorf("store proof err. %v", err)
+	}
+
+	buf.Reset()
+	buf.Grow(wire.BatchProofSerializeTargetSize(&ud.AccProof))
+	if err := wire.ProofTargetsSerialize(&buf, ud.AccProof.Targets); err != nil {
+		return err
+	}
+	if err := idx.targetState.StoreData(height, buf.Bytes()); err != nil {
+		return fmt.Errorf("store targets err. %v", err)
+	}
+
+	buf.Reset()
+	buf.Grow(ud.SerializeUtxoDataSize())
+	if err := wire.SerializeUtxoData(&buf, ud.LeafDatas); err != nil {
+		return err
+	}
+	if err := idx.leafDataState.StoreData(height, buf.Bytes()); err != nil {
+		return fmt.Errorf("store leaf data err. %v", err)
+	}
+
+	return nil
+}
+
+// storeUndoBlock serializes and stores undo blocks in the undo state.
+func (idx *FlatUtreexoProofIndex) storeUndoBlock(height int32,
+	proof *utreexo.Proof, delHashes []utreexo.Hash) error {
+
+	bytes, err := serializeUndoBlock(proof, delHashes)
+	if err != nil {
+		return err
+	}
+
+	err = idx.undoState.StoreData(height, bytes)
+	if err != nil {
+		return fmt.Errorf("store undoblock err. %v", err)
+	}
+
+	return nil
+}
+
+// storeRoots serializes and stores roots to the roots state.
+func (idx *FlatUtreexoProofIndex) storeRoots(height int32, p utreexo.Utreexo) error {
+	serialized, err := blockchain.SerializeUtreexoRoots(p.GetNumLeaves(), p.GetRoots())
+	if err != nil {
+		return err
+	}
+
+	err = idx.rootsState.StoreData(height, serialized)
+	if err != nil {
+		return fmt.Errorf("store roots err. %v", err)
+	}
+
+	return nil
+}
+
+// fetchUndoBlock returns the undoblock for the given block height.
+func (idx *FlatUtreexoProofIndex) fetchUndoBlock(height int32) (*utreexo.Proof, []utreexo.Hash, error) {
+	if height == 0 {
+		return nil, nil, fmt.Errorf("No Undo Block for height %d", height)
+	}
+
+	undoBytes, err := idx.undoState.FetchData(height)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	if bytes.Equal(undoBytes, emptyUndoBlock) {
+		return nil, nil, nil
+	}
+
+	return deserializeUndoBlock(undoBytes)
+}
+
+// fetchRoots returns the roots at the given height. It doesn't work for the current hegiht
+// and will return an error.
+func (idx *FlatUtreexoProofIndex) fetchRoots(height int32) (utreexo.Stump, error) {
+	if height == 0 {
+		return utreexo.Stump{}, nil
+	}
+
+	undoBytes, err := idx.rootsState.FetchData(height)
+	if err != nil {
+		return utreexo.Stump{}, err
+	}
+
+	numLeaves, roots, err := blockchain.DeserializeUtreexoRoots(undoBytes)
+	if err != nil {
+		return utreexo.Stump{}, err
+	}
+
+	return utreexo.Stump{Roots: roots, NumLeaves: numLeaves}, nil
+}
+
+// GenerateUData generates utreexo data for the dels passed in.  Height passed in
+// should either be of block height of where the deletions are happening or just
+// the lastest block height for mempool tx proof generation.
+func (idx *FlatUtreexoProofIndex) GenerateUData(dels []wire.LeafData) (*wire.UData, error) {
+	idx.mtx.RLock()
+	ud, err := wire.GenerateUData(dels, idx.utreexoState.state)
+	idx.mtx.RUnlock()
+	if err != nil {
+		return nil, err
+	}
+
+	return ud, nil
+}
+
+// ProveUtxos returns an accumulator proof of the outpoints passed in with
+// respect to the UTXO state at chaintip.
+//
+// NOTE The accumulator state differs at every block height.  The caller must
+// take into consideration that an accumulator proof at block X will not be valid
+// at block height X+1.
+//
+// This function is safe for concurrent access.
+func (idx *FlatUtreexoProofIndex) ProveUtxos(utxos []*blockchain.UtxoEntry,
+	outpoints *[]wire.OutPoint) (*blockchain.ChainTipProof, error) {
+
+	// We'll turn the entries and outpoints into leaves that go in
+	// the accumulator.
+	leaves := make([]wire.LeafData, 0, len(utxos))
+	for i, utxo := range utxos {
+		if utxo == nil || utxo.IsSpent() {
+			err := fmt.Errorf("Passed in utxo at index %d "+
+				"is nil or is already spent", i)
+			return nil, err
+		}
+
+		blockHash, err := idx.chain.BlockHashByHeight(utxo.BlockHeight())
+		if err != nil {
+			return nil, err
+		}
+		if blockHash == nil {
+			err := fmt.Errorf("Couldn't find blockhash for height %d",
+				utxo.BlockHeight())
+			return nil, err
+		}
+		leaf := wire.LeafData{
+			BlockHash:  *blockHash,
+			OutPoint:   (*outpoints)[i],
+			Amount:     utxo.Amount(),
+			PkScript:   utxo.PkScript(),
+			Height:     utxo.BlockHeight(),
+			IsCoinBase: utxo.IsCoinBase(),
+		}
+
+		leaves = append(leaves, leaf)
+	}
+
+	// Now we'll turn those leaves into hashes.  These are the hashes that are
+	// commited in the accumulator.
+	hashes := make([]utreexo.Hash, 0, len(leaves))
+	for _, leaf := range leaves {
+		hashes = append(hashes, leaf.LeafHash())
+	}
+
+	// Get a read lock for the index.  This will prevent connectBlock from updating
+	// the beststate snapshot and the utreexo state.
+	idx.mtx.RLock()
+	defer idx.mtx.RUnlock()
+
+	accProof, err := idx.utreexoState.state.Prove(hashes)
+	if err != nil {
+		return nil, err
+	}
+
+	// Grab the height and the blockhash the proof was generated at.
+	snapshot := idx.chain.BestSnapshot()
+	provedAtHash := snapshot.Hash
+
+	proof := &blockchain.ChainTipProof{
+		ProvedAtHash: &provedAtHash,
+		AccProof:     &accProof,
+		HashesProven: hashes,
+	}
+
+	return proof, nil
+}
+
+// VerifyAccProof verifies the given accumulator proof.  Returns an error if the
+// verification failed.
+func (idx *FlatUtreexoProofIndex) VerifyAccProof(toProve []utreexo.Hash,
+	proof *utreexo.Proof) error {
+	return idx.utreexoState.state.Verify(toProve, *proof, false)
+}
+
+// updateRootsState updates the roots accumulator state from the roots of the current accumulator.
+func (idx *FlatUtreexoProofIndex) updateRootsState() error {
+	idx.mtx.Lock()
+	numLeaves := idx.utreexoState.state.GetNumLeaves()
+	roots := idx.utreexoState.state.GetRoots()
+	idx.mtx.Unlock()
+
+	bytes, err := blockchain.SerializeUtreexoRoots(numLeaves, roots)
+	if err != nil {
+		return err
+	}
+
+	rootHash := sha256.Sum256(bytes)
+	return idx.utreexoRootsState.Modify([]utreexo.Leaf{{Hash: rootHash}}, nil, utreexo.Proof{})
+}
+
+// updateBlockTTLState updates the latest ttls that have have became final.
+func (idx *FlatUtreexoProofIndex) updateBlockTTLState(height int32) error {
+	// This means we've already initialized everything that we can.
+	if len(idx.blockTTLState) == len(idx.config.Params.TTL.Stump) {
+		return nil
+	}
+
+	for i, stump := range idx.config.Params.TTL.Stump {
+		// NumLeaves -1 as if we have 2 numleaves, it means the stump
+		// has heights 0 and 1.
+		if height < int32(stump.NumLeaves)-1 {
+			continue
+		}
+
+		// Skip if we've already initialized this ttl state.
+		if i < len(idx.blockTTLState) {
+			continue
+		}
+
+		// NumLeaves -1 as if we have 2 numleaves, it means the stump
+		// has heights 0 and 1.
+		p, err := idx.initTTLState(int32(stump.NumLeaves) - 1)
+		if err != nil {
+			return err
+		}
+
+		idx.blockTTLState = append(idx.blockTTLState, *p)
+	}
+
+	return nil
+}
+
+func (idx *FlatUtreexoProofIndex) fetchBlockSummary(blockHash *chainhash.Hash) (*wire.UtreexoBlockSummary, error) {
+	height, err := idx.chain.BlockHeightByHash(blockHash)
+	if err != nil {
+		return nil, err
+	}
+
+	ud, err := idx.FetchUtreexoProof(height)
+	if err != nil {
+		return nil, err
+	}
+
+	stump, err := idx.fetchRoots(height)
+	if err != nil {
+		return nil, err
+	}
+	var prevStump utreexo.Stump
+	if height-1 != 0 {
+		prevStump, err = idx.fetchRoots(height - 1)
+		if err != nil {
+			return nil, err
+		}
+	}
+	numAdds := stump.NumLeaves - prevStump.NumLeaves
+
+	return &wire.UtreexoBlockSummary{
+		BlockHash:    *blockHash,
+		NumAdds:      numAdds,
+		BlockTargets: ud.AccProof.Targets,
+	}, nil
+}
+
+// FetchTTLRoots returns the roots of the ttl summary state.
+func (idx *FlatUtreexoProofIndex) FetchTTLRoots() (utreexo.Stump, error) {
+	p, err := idx.initTTLState(idx.ttlState.BestHeight())
+	if err != nil {
+		return utreexo.Stump{}, err
+	}
+
+	return utreexo.Stump{
+		Roots:     p.GetRoots(),
+		NumLeaves: p.GetNumLeaves(),
+	}, nil
+}
+
+// FetchMsgUtreexoRoot returns a complete utreexoroot bitcoin message on the requested block.
+func (idx *FlatUtreexoProofIndex) FetchMsgUtreexoRoot(blockHash *chainhash.Hash) (*wire.MsgUtreexoRoot, error) {
+	height, err := idx.chain.BlockHeightByHash(blockHash)
+	if err != nil {
+		return nil, err
+	}
+
+	stump, err := idx.fetchRoots(height)
+	if err != nil {
+		return nil, err
+	}
+
+	bytes, err := blockchain.SerializeUtreexoRoots(stump.NumLeaves, stump.Roots)
+	if err != nil {
+		return nil, err
+	}
+	rootHash := sha256.Sum256(bytes)
+
+	proof, err := idx.utreexoRootsState.Prove([]utreexo.Hash{rootHash})
+	if err != nil {
+		return nil, err
+	}
+
+	msg := &wire.MsgUtreexoRoot{
+		NumLeaves: stump.NumLeaves,
+		Target:    proof.Targets[0],
+		BlockHash: *blockHash,
+		Roots:     stump.Roots,
+		Proof:     proof.Proof,
+	}
+
+	return msg, nil
+}
+
+// flatFilePath returns the path to the flatfile.
+func flatFilePath(dataDir, dataName string) string {
+	flatFileName := dataName + "_" + flatFileNameSuffix
+	flatFilePath := filepath.Join(dataDir, flatFileName)
+	return flatFilePath
+}
+
+// loadFlatFileState initializes the FlatFileState in the dataDir with
+// name used to name the directory and the dataFile that the data will be
+// stored to.
+func loadFlatFileState(dataDir, name string) (*FlatFileState, error) {
+	path := flatFilePath(dataDir, name)
+	ff := NewFlatFileState()
+
+	err := ff.Init(path, name)
+	if err != nil {
+		return nil, err
+	}
+
+	return ff, nil
+}
+
+// NewFlatUtreexoProofIndex returns a new instance of an indexer that is used to create a flat utreexo proof index.
+// The passed in maxMemoryUsage should be in bytes and it determines how much memory the proof index will use up.
+//
+// It implements the Indexer interface which plugs into the IndexManager that in
+// turn is used by the blockchain package.  This allows the index to be
+// seamlessly maintained along with the chain.
+func NewFlatUtreexoProofIndex(pruned bool, chainParams *chaincfg.Params,
+	maxMemoryUsage int64, dataDir string, flush func() error) (*FlatUtreexoProofIndex, error) {
+
+	idx := &FlatUtreexoProofIndex{
+		mtx: new(sync.RWMutex),
+		config: &UtreexoConfig{
+			MaxMemoryUsage: maxMemoryUsage,
+			Params:         chainParams,
+			Pruned:         pruned,
+			DataDir:        dataDir,
+			Name:           flatUtreexoProofIndexType,
+			FlushMainDB:    flush,
+		},
+	}
+
+	// Init the utreexo proof state if the node isn't pruned.
+	if !idx.config.Pruned {
+		targetState, err := loadFlatFileState(dataDir, flatUtreexoTargetName)
+		if err != nil {
+			return nil, err
+		}
+		idx.targetState = *targetState
+
+		proofState, err := loadFlatFileState(dataDir, flatUtreexoProofName)
+		if err != nil {
+			return nil, err
+		}
+		idx.proofState = *proofState
+
+		leafDataState, err := loadFlatFileState(dataDir, flatUtreexoLeafDataName)
+		if err != nil {
+			return nil, err
+		}
+		idx.leafDataState = *leafDataState
+
+		ttlsState, err := loadFlatFileState(dataDir, flatTTLsName)
+		if err != nil {
+			return nil, err
+		}
+		idx.ttlState = *ttlsState
+	}
+
+	// Init the undo block state.
+	undoState, err := loadFlatFileState(dataDir, flatUtreexoUndoName)
+	if err != nil {
+		return nil, err
+	}
+	idx.undoState = *undoState
+
+	proofStatsState, err := loadFlatFileState(dataDir, flatUtreexoProofStatsName)
+	if err != nil {
+		return nil, err
+	}
+	idx.proofStatsState = *proofStatsState
+
+	rootsState, err := loadFlatFileState(dataDir, flatUtreexoRootsName)
+	if err != nil {
+		return nil, err
+	}
+	idx.rootsState = *rootsState
+
+	err = idx.pStats.InitPStats(proofStatsState)
+	if err != nil {
+		return nil, err
+	}
+
+	return idx, nil
+}
+
+// DropFlatUtreexoProofIndex drops the address index from the provided database if it
+// exists.
+func DropFlatUtreexoProofIndex(db database.DB, dataDir string, interrupt <-chan struct{}) error {
+	err := dropIndex(db, flatUtreexoBucketKey, flatUtreexoProofIndexName, interrupt)
+	if err != nil {
+		return err
+	}
+
+	targetPath := flatFilePath(dataDir, flatUtreexoTargetName)
+	err = deleteFlatFile(targetPath)
+	if err != nil {
+		return err
+	}
+
+	proofPath := flatFilePath(dataDir, flatUtreexoProofName)
+	err = deleteFlatFile(proofPath)
+	if err != nil {
+		return err
+	}
+
+	leafDataPath := flatFilePath(dataDir, flatUtreexoLeafDataName)
+	err = deleteFlatFile(leafDataPath)
+	if err != nil {
+		return err
+	}
+
+	undoPath := flatFilePath(dataDir, flatUtreexoUndoName)
+	err = deleteFlatFile(undoPath)
+	if err != nil {
+		return err
+	}
+
+	proofStatsPath := flatFilePath(dataDir, flatUtreexoProofStatsName)
+	err = deleteFlatFile(proofStatsPath)
+	if err != nil {
+		return err
+	}
+
+	rootsPath := flatFilePath(dataDir, flatUtreexoRootsName)
+	err = deleteFlatFile(rootsPath)
+	if err != nil {
+		return err
+	}
+
+	ttlsPath := flatFilePath(dataDir, flatTTLsName)
+	err = deleteFlatFile(ttlsPath)
+	if err != nil {
+		return err
+	}
+
+	path := utreexoBasePath(&UtreexoConfig{DataDir: dataDir, Name: flatUtreexoProofIndexType})
+	return deleteUtreexoState(path)
+}
+
+// FlatUtreexoProofIndexInitialized returns true if the cfindex has been created previously.
+func FlatUtreexoProofIndexInitialized(db database.DB) bool {
+	var exists bool
+	db.View(func(dbTx database.Tx) error {
+		bucket := dbTx.Metadata().Bucket(flatUtreexoBucketKey)
+		exists = bucket != nil
+		return nil
+	})
+
+	return exists
+}

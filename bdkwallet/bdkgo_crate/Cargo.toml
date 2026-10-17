@@ -1,0 +1,23 @@
+[package]
+name = "bdkgo"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["staticlib"]
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+uniffi = "=0.28.3"
+weedle2 = "=4.0.0"
+thiserror = "1.0"
+bincode = "1"
+serde = { version = "1", features = ["derive"] }
+bdk_wallet = { version = "2.1.0", features = ["rusqlite", "keys-bip39"] }
+bdk_chain = "=0.23.1"
+rand = "0.8.5"
+
+[build-dependencies]
+uniffi = { version = "=0.28.3", features = [ "build" ] }
+weedle2 = "=4.0.0"

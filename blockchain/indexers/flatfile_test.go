@@ -1,0 +1,1088 @@
+// Copyright (c) 2021 The utreexo developers
+// Use of this source code is governed by an ISC
+// license that can be found in the LICENSE file.
+
+package indexers
+
+import (
+	"bytes"
+	"encoding/binary"
+	"encoding/hex"
+	"fmt"
+	"math"
+	"math/rand"
+	"os"
+	"path/filepath"
+	"reflect"
+	"sync"
+	"testing"
+	"testing/quick"
+	"time"
+
+	"github.com/stretchr/testify/require"
+)
+
+func TestInit(t *testing.T) {
+	t.Parallel()
+
+	tmpDir, err := os.MkdirTemp("", "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir) // clean up. Always runs
+
+	dir := "TestInit"
+	name := "data"
+	ffPath := filepath.Join(tmpDir, dir)
+
+	ff := NewFlatFileState()
+	err = ff.Init(ffPath, name)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Check that the directory is there.
+	_, err = os.Stat(ffPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Check that the file is under the directory.
+	_, err = os.Stat(filepath.Join(ffPath, name+dataFileSuffix))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Check that the offsetfile is under the directory.
+	_, err = os.Stat(filepath.Join(ffPath, offsetFileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A function with boilerplate for the FlatFileState init.
+func initFF(testName string) (*FlatFileState, string, error) {
+	tmpDir, err := os.MkdirTemp("", "test")
+	if err != nil {
+		return nil, "", err
+	}
+
+	dir := testName
+	name := "data"
+	ffPath := filepath.Join(tmpDir, dir)
+
+	ff := NewFlatFileState()
+	err = ff.Init(ffPath, name)
+	if err != nil {
+		return nil, "", err
+	}
+
+	return ff, tmpDir, nil
+}
+
+func closeFF(ff *FlatFileState) (int32, int64, []int64, error) {
+	ff.mtx.Lock()
+	defer ff.mtx.Unlock()
+
+	err := ff.offsetFile.Close()
+	if err != nil {
+		return 0, 0, nil, err
+	}
+
+	err = ff.dataFile.Close()
+	if err != nil {
+		return 0, 0, nil, err
+	}
+
+	return ff.currentHeight, ff.currentOffset, ff.offsets, nil
+}
+
+func restartFF(tmpDir, testName string) (*FlatFileState, error) {
+	dir := testName
+	name := "data"
+	ffPath := filepath.Join(tmpDir, dir)
+
+	ff := NewFlatFileState()
+	err := ff.Init(ffPath, name)
+	if err != nil {
+		return nil, err
+	}
+
+	return ff, nil
+}
+
+func TestRestart(t *testing.T) {
+	t.Parallel()
+
+	ff, tmpDir, err := initFF("TestRestart")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Store random data to the flatfile.  Keep a copy of the stored
+	// data in a map.
+	storedData := make(map[int32][]byte)
+	rnd := rand.New(rand.NewSource(time.Now().UnixNano()))
+
+	blockCount := int32(1000)
+	for i := int32(1); i <= blockCount; i++ {
+		data, err := createRandByteSlice(rnd)
+		if err != nil {
+			t.Fatal(err)
+		}
+		storedData[i] = data
+
+		err = ff.StoreData(i, data)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	expectHeight, expectCurrentOffset, offsets, err := closeFF(ff)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectOffsets := make([]int64, len(offsets))
+	copy(expectOffsets, offsets)
+
+	ff = nil
+
+	newff, err := restartFF(tmpDir, "TestRestart")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	if newff.currentHeight != expectHeight {
+		err := fmt.Errorf("TestRestart Err. Expect currentHeight of "+
+			"%d, got %d", expectHeight, newff.currentHeight)
+		t.Fatal(err)
+	}
+
+	if newff.currentOffset != expectCurrentOffset {
+		err := fmt.Errorf("TestRestart Err. Expect currentOffset of "+
+			"%d, got %d", expectCurrentOffset, newff.currentOffset)
+		t.Fatal(err)
+	}
+
+	if len(newff.offsets) != len(expectOffsets) {
+		err := fmt.Errorf("TestRestart Err. Expect offset length of "+
+			"%d, got %d", len(expectOffsets), len(newff.offsets))
+		t.Fatal(err)
+	}
+
+	for i, expectOffset := range expectOffsets {
+		if expectOffset != newff.offsets[i] {
+			err := fmt.Errorf("TestRestart Err. Expect offset at i of %d "+
+				"to be %d, got %d", i, expectOffset, newff.offsets[i])
+			t.Fatal(err)
+		}
+	}
+}
+
+func createRandByteSlice(rnd *rand.Rand) ([]byte, error) {
+	const length = 20
+	// Random value to differ up the array lengths.
+	arrayVal, ok := quick.Value(reflect.TypeOf([length]byte{}), rnd)
+	if !ok {
+		err := fmt.Errorf("Failed to create slice")
+		return nil, err
+	}
+	array := arrayVal.Interface().([length]byte)
+	sliceLen := rand.Intn(length)
+	return array[:sliceLen], nil
+}
+
+// tryToStoreUnallowed tries to store unallowed height to the flatFileState.
+func tryToStoreUnallowed(ff *FlatFileState, height int32, data []byte) error {
+	// This should error out.
+	err := ff.StoreData(height-1, data)
+	if err == nil {
+		return fmt.Errorf("Should not be able to store data for height %d "+
+			"when ff.currentHeight is %d but successfully did so",
+			height-1, ff.currentHeight)
+	}
+
+	// This should error out.
+	err = ff.StoreData(height+1, data)
+	if err == nil {
+		return fmt.Errorf("Should not be able to store data for height %d "+
+			"when ff.currentHeight is %d but successfully did so",
+			height+1, ff.currentHeight)
+	}
+
+	return nil
+}
+
+func TestStoreAndFetchData(t *testing.T) {
+	t.Parallel()
+
+	ff, tmpDir, err := initFF("TestStoreAndFetchData")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir) // clean up. Always runs
+
+	// Store random data to the flatfile.  Keep a copy of the stored
+	// data in a map.
+	storedData := make(map[int32][]byte)
+	rnd := rand.New(rand.NewSource(time.Now().UnixNano()))
+
+	blockCount := int32(1000)
+	for i := int32(1); i <= blockCount; i++ {
+		data, err := createRandByteSlice(rnd)
+		if err != nil {
+			t.Fatal(err)
+		}
+		storedData[i] = data
+
+		// Try to store unallowed.
+		err = tryToStoreUnallowed(ff, i, data)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Actually do the store.
+		err = ff.StoreData(i, data)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Check that the height matches.
+	if ff.currentHeight != blockCount {
+		err := fmt.Errorf("Expected currentHeight of %d but got %d",
+			blockCount, ff.currentHeight)
+		t.Fatal(err)
+	}
+
+	// Check that the height matches.
+	dataOffset, err := ff.dataFile.Seek(0, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ff.currentOffset != dataOffset {
+		err := fmt.Errorf("Expected currentOffset of %d but got %d",
+			dataOffset, ff.currentOffset)
+		t.Fatal(err)
+	}
+
+	// Check that the offset count matches.
+	if len(ff.offsets) != int(blockCount)+1 {
+		err := fmt.Errorf("Expected offsets length of %d but got %d",
+			blockCount+1, len(ff.offsets))
+		t.Fatal(err)
+	}
+
+	// Check that the offset size matches.
+	offsetOffset, err := ff.offsetFile.Seek(0, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if (int64(blockCount)*8)+8 != offsetOffset {
+		err := fmt.Errorf("Expected currentOffset of %d but got %d",
+			offsetOffset, (blockCount*8)+8)
+		t.Fatal(err)
+	}
+
+	// Fetch and compare to the data stored in the map.
+	for key, value := range storedData {
+		fetchedBytes, err := ff.FetchData(key)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if !bytes.Equal(fetchedBytes, value) {
+			err := fmt.Errorf("Expected %x but got %x", value, fetchedBytes)
+			t.Fatal(err)
+		}
+	}
+}
+
+// tryToDisconnectUnallowed tries to disconnect unallowed height from the flatFileState.
+func tryToDisconnectUnallowed(ff *FlatFileState, height int32) error {
+	// This should error out.
+	err := ff.DisconnectBlock(height - 1)
+	if err == nil {
+		return fmt.Errorf("Should not be able to disconnect block for height %d "+
+			"when ff.currentHeight is %d but successfully did so",
+			height-1, ff.currentHeight)
+	}
+
+	// This should error out.
+	err = ff.DisconnectBlock(height + 1)
+	if err == nil {
+		return fmt.Errorf("Should not be able to disconnect block for height %d "+
+			"when ff.currentHeight is %d but successfully did so",
+			height+1, ff.currentHeight)
+	}
+
+	return nil
+}
+
+// getAfterSizes returns the correct file sizes after a disconnect.
+func getAfterSizes(ff *FlatFileState, height int32) (int64, int64, error) {
+	// Get the size of the data to be disconnected.
+	offset := ff.offsets[height]
+	buf := make([]byte, 8)
+
+	_, err := ff.dataFile.ReadAt(buf, offset)
+	if err != nil {
+		return 0, 0, err
+	}
+	if !bytes.Equal(buf[:4], magicBytes[:]) {
+		return 0, 0, fmt.Errorf("read wrong magic of %x", buf[:4])
+	}
+	dataSize := binary.BigEndian.Uint32(buf[4:])
+
+	// Get data file size.
+	dataFileSize, err := ff.dataFile.Seek(0, 2)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	// Get offset file size.
+	offsetSize, err := ff.offsetFile.Seek(0, 2)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	return dataFileSize - int64(dataSize+8), offsetSize - 8, nil
+}
+
+func getSizes(ff *FlatFileState) (int64, int64, error) {
+	dataSize, err := ff.dataFile.Seek(0, 2)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	offsetSize, err := ff.offsetFile.Seek(0, 2)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	return dataSize, offsetSize, nil
+}
+
+// ffStoreRandData generates and stores the data onto the map and the FlatFileState.
+// Returns the map with the newly generated data.
+func ffStoreRandData(blockCount int32, rnd *rand.Rand, ff *FlatFileState) (
+	map[int32][]byte, error) {
+
+	storedData := make(map[int32][]byte)
+
+	for i := int32(1); i <= blockCount; i++ {
+		data, err := createRandByteSlice(rnd)
+		if err != nil {
+			return nil, err
+		}
+		storedData[i] = data
+
+		err = ff.StoreData(i, data)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return storedData, nil
+}
+
+// Given the lastHeight, check that all data from block 0 to block lastHeight
+// equals the data in the map.
+func checkDataStillFetches(lastHeight int32, ff *FlatFileState, storedData map[int32][]byte) error {
+	for i := int32(0); i < lastHeight; i++ {
+		gotBytes, err := ff.FetchData(i)
+		if err != nil {
+			return err
+		}
+
+		expectBytes := storedData[i]
+
+		if !bytes.Equal(expectBytes, gotBytes) {
+			err := fmt.Errorf("Expected to fetch %s but got %s",
+				hex.EncodeToString(expectBytes), hex.EncodeToString(gotBytes))
+			return err
+		}
+	}
+
+	return nil
+}
+
+func TestDisconnectBlock(t *testing.T) {
+	t.Parallel()
+
+	ff, tmpDir, err := initFF("TestDisconnectBlock")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir) // clean up. Always runs
+
+	// Store random data to the flatfile.  Keep a copy of the stored
+	// data in a map.
+	blockCount := int32(1000)
+	rnd := rand.New(rand.NewSource(time.Now().UnixNano()))
+
+	storedData, err := ffStoreRandData(blockCount, rnd, ff)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Disconnect blocks til height 100.
+	for ; blockCount > 100; blockCount-- {
+		// Check that we can get the latest block.
+		gotData, err := ff.FetchData(blockCount)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		expectData := storedData[blockCount]
+		if !bytes.Equal(expectData, gotData) {
+			err := fmt.Errorf("Expected %x but got %x for height %d",
+				expectData, gotData, blockCount)
+			t.Fatal(err)
+		}
+
+		err = tryToDisconnectUnallowed(ff, blockCount)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		dataSizeExpect, offsetSizeExpect, err := getAfterSizes(ff, blockCount)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		offsetLen := len(ff.offsets)
+
+		// Disconnect the last block.
+		err = ff.DisconnectBlock(blockCount)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		err = checkDataStillFetches(blockCount, ff, storedData)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Sanity check to make sure only one offset is added.
+		offsetLenAfter := len(ff.offsets)
+		if offsetLen-1 != offsetLenAfter {
+			err := fmt.Errorf("expected offset len of %d but got %d",
+				offsetLen-1, offsetLenAfter)
+			t.Fatal(err)
+		}
+
+		dataSize, offsetSize, err := getSizes(ff)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Check the sizes after the disconnect.
+		if dataSizeExpect != dataSize {
+			err := fmt.Errorf("Expected dataFile size of %d but got %d",
+				dataSizeExpect, dataSize)
+			t.Fatal(err)
+		}
+		if offsetSizeExpect != offsetSize {
+			err := fmt.Errorf("Expected offsetFile size of %d but got %d",
+				offsetSizeExpect, offsetSize)
+			t.Fatal(err)
+		}
+
+		// Try to fetch that data.  Error if we get anything else other than
+		// nil.
+		shouldBeNil, err := ff.FetchData(blockCount)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if shouldBeNil != nil {
+			err := fmt.Errorf("Expected nil but fetched %v", shouldBeNil)
+			t.Fatal(err)
+		}
+	}
+
+	// Store 1000 blocks of new data from the current height after the disconnects.
+	newStoredData := make(map[int32][]byte)
+	for i := ff.currentHeight + 1; i <= 1000; i++ {
+		data, err := createRandByteSlice(rnd)
+		if err != nil {
+			t.Fatal(err)
+		}
+		newStoredData[i] = data
+
+		err = ff.StoreData(i, data)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		for j := int32(0); j <= 100; j++ {
+			gotBytes, err := ff.FetchData(j)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			expectBytes := storedData[j]
+
+			if !bytes.Equal(expectBytes, gotBytes) {
+				err := fmt.Errorf("Expected to fetch %s but got %s",
+					hex.EncodeToString(expectBytes), hex.EncodeToString(gotBytes))
+				t.Fatal(err)
+			}
+		}
+	}
+
+	// Check that all the data in the flatfile fetches and equals the data stored
+	// in the map.
+	for i := int32(0); i <= ff.currentHeight; i++ {
+		gotBytes, err := ff.FetchData(i)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// The data from blocks 0-100 are in the storedData map.  All else
+		// are in the newStoredData map.
+		if i <= 100 {
+			expectBytes := storedData[i]
+
+			if !bytes.Equal(expectBytes, gotBytes) {
+				err := fmt.Errorf("Expected to fetch %s but got %s",
+					hex.EncodeToString(expectBytes), hex.EncodeToString(gotBytes))
+				t.Fatal(err)
+			}
+		} else {
+			expectBytes := newStoredData[i]
+
+			if !bytes.Equal(expectBytes, gotBytes) {
+				err := fmt.Errorf("Expected to fetch %s but got %s",
+					hex.EncodeToString(expectBytes), hex.EncodeToString(gotBytes))
+				t.Fatal(err)
+			}
+		}
+	}
+}
+
+// ffReader reads from the FlatFileState and compares it to the data stored
+// on the map.  Only fetches random values that are specified between minBlock
+// and maxBlock.
+func ffReader(readPerWorker, minBlock, maxBlock int, ff *FlatFileState,
+	wg *sync.WaitGroup, storedData map[int32][]byte) {
+
+	defer wg.Done()
+
+	randSource := rand.NewSource(time.Now().UnixNano())
+	rand := rand.New(randSource)
+	for i := 0; i < readPerWorker; i++ {
+		getHeight := int32(rand.Intn(maxBlock-minBlock) + minBlock)
+		gotBytes, err := ff.FetchData(getHeight)
+		if err != nil {
+			// TODO Would be better if we don't panic and do t.Error()
+			panic(err)
+		}
+
+		expectBytes := storedData[getHeight]
+
+		if !bytes.Equal(gotBytes, expectBytes) {
+			err := fmt.Errorf("TestMultipleFetchData: Expected %s but got %s for height %v",
+				hex.EncodeToString(expectBytes), hex.EncodeToString(gotBytes), getHeight)
+			// TODO Would be better if we don't panic and do t.Error()
+			panic(err)
+		}
+	}
+}
+
+func TestMultipleFetchData(t *testing.T) {
+	t.Parallel()
+
+	ff, tmpDir, err := initFF("TestMultipleFetchData")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir) // clean up. Always runs
+
+	rnd := rand.New(rand.NewSource(time.Now().UnixNano()))
+	blockCount := int32(1000)
+
+	// Store random data to the flatfile.  Keep a copy of the stored
+	// data in a map.
+	storedData, err := ffStoreRandData(blockCount, rnd, ff)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	readWorkerCount := 100
+	readPerWorker := 1000
+	readBlockCount := blockCount
+	wg := new(sync.WaitGroup)
+
+	for i := 0; i < readWorkerCount; i++ {
+		wg.Add(1)
+		// Generating block 0 as min block read tests if FetchData
+		// correctly rejects block 0 reads.
+		go ffReader(readPerWorker, 0, int(readBlockCount), ff, wg, storedData)
+	}
+
+	// Generate new blocks and store it in a new map.  Tests concurrent
+	// writes while reads are still going.
+	addCount := int32(50)
+	newStoredData := make(map[int32][]byte)
+	newCount := blockCount + addCount
+	for i := blockCount + 1; i <= newCount; i++ {
+		data, err := createRandByteSlice(rnd)
+		if err != nil {
+			t.Fatal(err)
+		}
+		newStoredData[i] = data
+
+		err = ff.StoreData(i, data)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Fetch only the newly generated blocks and see if they match up to
+	// the ones we have in the map.
+	maxBlk := int(newCount)
+	minBlk := int(blockCount) + 1
+	for i := 0; i < readWorkerCount; i++ {
+		wg.Add(1)
+		go ffReader(readPerWorker, minBlk, maxBlk, ff, wg, newStoredData)
+	}
+
+	wg.Wait()
+}
+
+func TestRecover(t *testing.T) {
+	rnd := rand.New(rand.NewSource(time.Now().UnixNano()))
+
+	tests := []struct {
+		name               string
+		datas              [][]byte
+		truncateLen        int64
+		truncateOffsetFile bool
+	}{
+		{
+			name: "first",
+			datas: func() [][]byte {
+				datas := make([][]byte, 0, 100)
+				for i := int32(1); i <= 100; i++ {
+					data, err := createRandByteSlice(rnd)
+					if err != nil {
+						t.Fatal(err)
+					}
+					datas = append(datas, data)
+				}
+
+				return datas
+			}(),
+			truncateLen:        1,
+			truncateOffsetFile: true,
+		},
+		{
+			name: "second",
+			datas: func() [][]byte {
+				datas := make([][]byte, 0, 100)
+				for i := int32(1); i <= 100; i++ {
+					data, err := createRandByteSlice(rnd)
+					if err != nil {
+						t.Fatal(err)
+					}
+					datas = append(datas, data)
+				}
+
+				return datas
+			}(),
+			truncateLen:        7,
+			truncateOffsetFile: true,
+		},
+		{
+			name: "third",
+			datas: func() [][]byte {
+				datas := make([][]byte, 0, 100)
+				for i := int32(1); i <= 100; i++ {
+					data, err := createRandByteSlice(rnd)
+					if err != nil {
+						t.Fatal(err)
+					}
+					datas = append(datas, data)
+				}
+
+				return datas
+			}(),
+			truncateLen:        5,
+			truncateOffsetFile: true,
+		},
+		{
+			name: "fourth",
+			datas: func() [][]byte {
+				datas := make([][]byte, 0, 100)
+				for i := int32(1); i <= 100; i++ {
+					data, err := createRandByteSlice(rnd)
+					if err != nil {
+						t.Fatal(err)
+					}
+					datas = append(datas, data)
+				}
+
+				return datas
+			}(),
+			truncateLen:        1,
+			truncateOffsetFile: false,
+		},
+		{
+			name: "fifth",
+			datas: func() [][]byte {
+				datas := make([][]byte, 0, 100)
+				for i := int32(1); i <= 100; i++ {
+					data, err := createRandByteSlice(rnd)
+					if err != nil {
+						t.Fatal(err)
+					}
+					datas = append(datas, data)
+				}
+
+				return datas
+			}(),
+			truncateLen:        15,
+			truncateOffsetFile: false,
+		},
+		{
+			name: "sixth",
+			datas: func() [][]byte {
+				datas := make([][]byte, 0, 100)
+				for i := int32(1); i <= 100; i++ {
+					data, err := createRandByteSlice(rnd)
+					if err != nil {
+						t.Fatal(err)
+					}
+					datas = append(datas, data)
+				}
+
+				return datas
+			}(),
+			truncateLen:        155,
+			truncateOffsetFile: false,
+		},
+	}
+
+	for _, test := range tests {
+		tmpDir := t.TempDir()
+		dir := filepath.Join(tmpDir, "dir_"+test.name)
+		defer deleteFlatFile(dir)
+
+		// Create and store data in the flat file state to test it.
+		ff := NewFlatFileState()
+		err := ff.Init(dir, test.name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i, data := range test.datas {
+			err = ff.StoreData(int32(i)+1, data)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		// Sanity checking.
+		for i, data := range test.datas {
+			fetched, err := ff.FetchData(int32(i) + 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if !bytes.Equal(fetched, data) {
+				t.Fatalf("test %v. for height %v, expected %v, got %v",
+					test.name,
+					i,
+					hex.EncodeToString(test.datas[i-1]),
+					hex.EncodeToString(fetched))
+			}
+		}
+
+		// Corrupt the flat file state.
+		if test.truncateOffsetFile {
+			offsetFileSize, err := ff.offsetFile.Seek(0, 2)
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = ff.offsetFile.Truncate(offsetFileSize - test.truncateLen)
+			if err != nil {
+				t.Fatal(err)
+			}
+		} else {
+			dataFileSize, err := ff.dataFile.Seek(0, 2)
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = ff.dataFile.Truncate(dataFileSize - test.truncateLen)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			// Test if we can fetch the last stored data.
+			_, err = ff.FetchData(ff.currentHeight)
+			if err == nil {
+				t.Fatalf("test %v. expected error", test.name)
+			}
+		}
+
+		// Calling init here calls the recovery functions.
+		err = ff.Init(dir, test.name)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Check that the data til the currentHeight is correct.
+		for i := int32(1); i <= ff.currentHeight; i++ {
+			fetched, err := ff.FetchData(i)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(fetched, test.datas[i-1]) {
+				t.Fatalf("test %v. for height %v, expected %v, got %v",
+					test.name,
+					i,
+					hex.EncodeToString(test.datas[i-1]),
+					hex.EncodeToString(fetched))
+			}
+		}
+	}
+}
+
+func TestOverWrite(t *testing.T) {
+	tests := []struct {
+		name         string
+		adds         []int32
+		spends       [][][2]uint32
+		expectedTTLs [][]int32
+	}{
+		{
+			name: "first",
+			adds: []int32{5, 1, 7},
+			spends: [][][2]uint32{
+				{},
+				{
+					{1, 0}, {1, 4},
+				},
+				{
+					{1, 3}, {2, 0},
+				},
+			},
+			expectedTTLs: [][]int32{
+				{1, -1, -1, 2, 1},
+				{1},
+				{-1, -1, -1, -1, -1, -1, -1},
+			},
+		},
+		{
+			name: "second",
+			adds: []int32{5, 1, 7, 8, 1, 2},
+			spends: [][][2]uint32{
+				{},
+				{},
+				{},
+				{{3, 0}, {3, 6}},
+				{},
+				{{1, 0}, {1, 1}, {1, 2}, {1, 4}},
+			},
+			expectedTTLs: [][]int32{
+				{5, 5, 5, -1, 5},
+				{-1},
+				{1, -1, -1, -1, -1, -1, 1},
+				{-1, -1, -1, -1, -1, -1, -1, -1},
+				{-1},
+				{-1, -1},
+			},
+		},
+	}
+
+	for _, test := range tests {
+		tmpDir := t.TempDir()
+		dir := filepath.Join(tmpDir, "dir_"+test.name)
+		defer deleteFlatFile(dir)
+
+		// Create and store data in the flat file state to test it.
+		ff := NewFlatFileState()
+		err := ff.Init(dir, test.name)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		b := [4]byte{0xff, 0xff, 0xff, 0xff}
+		for i, add := range test.adds {
+			buf := make([]byte, 0, add*4)
+			for i := 0; i < int(add); i++ {
+				buf = append(buf, b[:]...)
+			}
+
+			err = ff.StoreData(int32(i)+1, buf)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			spends := test.spends[i]
+			for _, spend := range spends {
+				ttl := uint32(i+1) - spend[0]
+				offset := int32(spend[1]) * 4
+
+				buf := make([]byte, 4)
+				byteOrder.PutUint32(buf, ttl)
+				err = ff.OverWrite(int32(spend[0]), offset, buf)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+
+		for i := 0; i < len(test.adds); i++ {
+			data, err := ff.FetchData(int32(i + 1))
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if len(data)%4 != 0 {
+				t.Fatalf("data corrupted")
+			}
+
+			ttls := make([]int32, len(data)/4)
+			for j := range ttls {
+				start := j * 4
+				ttl := byteOrder.Uint32(data[start : start+4])
+				if ttl == math.MaxUint32 {
+					ttls[j] = -1
+				}
+				ttls[j] = int32(ttl)
+			}
+
+			require.Equal(t, test.expectedTTLs[i], ttls)
+		}
+	}
+}
+
+// TestRecoverResetsCurrentOffset truncates the second record's header and
+// reopens the index. Recovery must position the next write at the end of the
+// surviving first record, which must remain intact after storing a replacement.
+func TestRecoverResetsCurrentOffset(t *testing.T) {
+	dir := t.TempDir()
+	ff := NewFlatFileState()
+	if err := ff.Init(dir, "recover-offset"); err != nil {
+		t.Fatal(err)
+	}
+
+	first := []byte("first record remains intact")
+	second := []byte("second record is truncated")
+	if err := ff.StoreData(1, first); err != nil {
+		t.Fatal(err)
+	}
+	if err := ff.StoreData(2, second); err != nil {
+		t.Fatal(err)
+	}
+	firstEnd := int64(8 + len(first))
+	if err := ff.dataFile.Truncate(firstEnd + 4); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened := NewFlatFileState()
+	if err := reopened.Init(dir, "recover-offset"); err != nil {
+		t.Fatal(err)
+	}
+	if reopened.currentHeight != 1 {
+		t.Fatalf("recovered height: got %d, want 1", reopened.currentHeight)
+	}
+	if reopened.currentOffset != firstEnd {
+		t.Fatalf("recovered offset: got %d, want %d", reopened.currentOffset, firstEnd)
+	}
+
+	replacement := []byte("replacement second record")
+	if err := reopened.StoreData(2, replacement); err != nil {
+		t.Fatal(err)
+	}
+	got, err := reopened.FetchData(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	require.Equal(t, first, got)
+}
+
+// TestOverWriteRejectsRecordBoundary attempts a write that starts inside the
+// first record's payload but extends into the next record's header. The write
+// must fail and leave the next record readable and unchanged.
+func TestOverWriteRejectsRecordBoundary(t *testing.T) {
+	dir := t.TempDir()
+	ff := NewFlatFileState()
+	if err := ff.Init(dir, "overwrite-boundary"); err != nil {
+		t.Fatal(err)
+	}
+	if err := ff.StoreData(1, make([]byte, 8)); err != nil {
+		t.Fatal(err)
+	}
+	if err := ff.StoreData(2, []byte("next record")); err != nil {
+		t.Fatal(err)
+	}
+
+	err := ff.OverWrite(1, 4, make([]byte, 8))
+	if err == nil {
+		t.Fatal("expected overwrite crossing the record boundary to fail")
+	}
+	got, fetchErr := ff.FetchData(2)
+	if fetchErr != nil {
+		t.Fatal(fetchErr)
+	}
+	require.Equal(t, []byte("next record"), got)
+}
+
+// TestRecoverEmptyThenAppend truncates the only record so recovery removes it.
+// The next store must start at byte zero and be readable through its new offset.
+func TestRecoverEmptyThenAppend(t *testing.T) {
+	dir := t.TempDir()
+	ff := NewFlatFileState()
+	require.NoError(t, ff.Init(dir, "empty"))
+	require.NoError(t, ff.StoreData(1, []byte("incomplete")))
+	require.NoError(t, ff.dataFile.Truncate(4))
+	require.NoError(t, ff.dataFile.Close())
+	require.NoError(t, ff.offsetFile.Close())
+
+	ff = NewFlatFileState()
+	require.NoError(t, ff.Init(dir, "empty"))
+	t.Cleanup(func() { ff.dataFile.Close(); ff.offsetFile.Close() })
+	require.Equal(t, int32(0), ff.BestHeight())
+	require.Equal(t, int64(0), ff.currentOffset)
+	require.NoError(t, ff.StoreData(1, []byte("replacement")))
+	require.Equal(t, int64(0), ff.offsets[1])
+	got, err := ff.FetchData(1)
+	require.NoError(t, err)
+	require.Equal(t, []byte("replacement"), got)
+}
+
+// TestOverWriteRejectsZeroOffset redirects the second record's offset to the
+// first record. Even though the destination has valid framing and enough room,
+// the write must fail without changing the first record's payload.
+func TestOverWriteRejectsZeroOffset(t *testing.T) {
+	ff := NewFlatFileState()
+	require.NoError(t, ff.Init(t.TempDir(), "zero-offset"))
+	t.Cleanup(func() { ff.dataFile.Close(); ff.offsetFile.Close() })
+	require.NoError(t, ff.StoreData(1, []byte("original")))
+	require.NoError(t, ff.StoreData(2, make([]byte, 8)))
+	ff.offsets[2] = 0
+	require.Error(t, ff.OverWrite(2, 0, []byte("corrupt!")))
+	got, err := ff.FetchData(1)
+	require.NoError(t, err)
+	require.Equal(t, []byte("original"), got)
+}
+
+// TestStoreFailureDoesNotPublishOffset closes the data file to force a store
+// failure. Neither the offset table nor the in-memory height and offsets may
+// advance to reference the unwritten record.
+func TestStoreFailureDoesNotPublishOffset(t *testing.T) {
+	ff := NewFlatFileState()
+	require.NoError(t, ff.Init(t.TempDir(), "failed-store"))
+	t.Cleanup(func() { ff.offsetFile.Close() })
+	require.NoError(t, ff.dataFile.Close())
+	require.Error(t, ff.StoreData(1, []byte("unwritten")))
+	require.Equal(t, int32(0), ff.BestHeight())
+	require.Len(t, ff.offsets, 1)
+	info, err := ff.offsetFile.Stat()
+	require.NoError(t, err)
+	require.Equal(t, int64(8), info.Size())
+}

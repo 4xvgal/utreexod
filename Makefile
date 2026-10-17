@@ -1,0 +1,34 @@
+UNIFFI_BINDGEN_GO_VERSION := 0.4.0+v0.28.3
+
+help: ## Display help
+	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-30s\033[0m %s\n", $$1, $$2}'
+
+install-rust: ## Install rust if not installed
+	if ! type cargo; then curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh ; fi
+
+install-uniffi-bindgen-go: install-rust ## Install uniffi-bindgen-go at the pinned version if missing or stale
+	if ! uniffi-bindgen-go --version 2>/dev/null | grep -q "$(UNIFFI_BINDGEN_GO_VERSION)"; then CARGO_NET_GIT_FETCH_WITH_CLI=true cargo install uniffi-bindgen-go --git https://github.com/NordSecurity/uniffi-bindgen-go --tag v$(UNIFFI_BINDGEN_GO_VERSION) --locked --force; fi
+
+build-bdk: install-uniffi-bindgen-go ## Build BDK static library
+	uniffi-bindgen-go -o bdkwallet bdkwallet/bdkgo_crate/src/bdkgo.udl
+	cargo build --release
+
+build-utreexod: build-bdk ## Build utreexod with all features
+	go build --tags=bdkwallet -o . ./...
+
+build-utreexod-without-bdk: ## Build utreexod without BDK wallet
+	go build -o . ./...
+
+install: build-bdk ## Install binaries to GOPATH
+	go install --tags=bdkwallet ./...
+
+test: build-bdk ## Run all test
+	cargo test
+	sh ./goclean.sh
+
+all: build-bdk build-utreexod ## Build all
+
+clean: ## Clean all
+	rm utreexod
+	go clean
+	cargo clean
