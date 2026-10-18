@@ -1,0 +1,2091 @@
+package utreexo
+
+import (
+	"encoding/binary"
+	"fmt"
+	"io"
+	"math/bits"
+	"os"
+	"path/filepath"
+	"sync"
+
+	"github.com/utreexo/utreexo/internal/mmapfile"
+	"golang.org/x/exp/slices"
+)
+
+const (
+	// defaultForestRows is the tree height used by OpenForest.
+	// With forestRows=63 the position arithmetic works via unsigned
+	// wrapping; the compact file layout (posToFileOffset) maps tree
+	// positions to dense row-based offsets so file offsets stay within
+	// int64 range.
+	defaultForestRows = 63
+
+	// maxFileLeavesBits caps the per-row slot count used by the
+	// compact file layout.  Row r gets 1<<(maxFileLeavesBits-r) slots
+	// (min 1).  With 34 this supports up to ~17 billion leaves while
+	// keeping the sparse data file around 1 TB apparent size.
+	maxFileLeavesBits = 34
+
+	// File names used by OpenForest within the dbpath directory.
+	forestDataFileName        = "forest_data.dat"         // main hash data, 32 bytes per position
+	forestDeletedFileName     = "forest_deleted.dat"      // deleted-leaf bitmap, 8 bytes per word
+	forestBlockCountsFileName = "forest_blockcounts.dat"  // per-block add count, 4 bytes each
+	forestJournalFileName     = "forest_journal.dat"      // WAL journal for crash recovery
+	forestMetaFileName        = "forest_meta.dat"         // persistent metadata slots; see Forest.metaFile
+	forestPosMapCtrlFileName  = "forest_posmap_ctrl.dat"  // Swiss Table control bytes, mmap'd
+	forestPosMapSlotsFileName = "forest_posmap_slots.dat" // Swiss Table slot values, mmap'd
+)
+
+// rowBaseOffset returns the byte offset where row r begins in the data
+// file.  Rows 0..capBits each have 1<<(capBits-r) slots of 32 bytes
+// (a geometric series).  row must be <= capBits.
+func rowBaseOffset(row, forestRows uint8) int64 {
+	capBits := min(forestRows, maxFileLeavesBits)
+	return (int64(1)<<(capBits+1) - int64(1)<<(capBits-row+1)) * 32
+}
+
+// dataFileSize returns the total byte size of the compact data file
+// for the given forestRows.  Rows 0..capBits follow the geometric
+// series; rows capBits+1..63 each have a single 32-byte slot.
+func dataFileSize(forestRows uint8) int64 {
+	capBits := min(forestRows, maxFileLeavesBits)
+	return (int64(1)<<(capBits+1) - 1 + int64(63-capBits)) * 32
+}
+
+// Assert that Forest implements the Utreexo interface.
+var _ Utreexo = (*Forest)(nil)
+
+// forestFile is the interface required for the cachedRWS underlying file.
+// All I/O is positional; there is no shared seek position to coordinate
+// across goroutines.
+//
+// HashAt returns the 32 bytes at the given offset by value, so callers
+// can verify hashes without passing a stack-local buffer through
+// io.ReaderAt (which would force it to escape to the heap).
+type forestFile interface {
+	io.ReaderAt
+	io.WriterAt
+	HashAt(off int64) ([32]byte, error)
+}
+
+// rawFile wraps *os.File so it satisfies forestFile. Used for auxiliary
+// files (meta, blockCounts, deleted bitmap) where HashAt is required by
+// the interface but the call path never actually exercises it.
+type rawFile struct{ *os.File }
+
+func (r rawFile) HashAt(off int64) ([32]byte, error) {
+	var h [32]byte
+	_, err := r.ReadAt(h[:], off)
+	return h, err
+}
+
+// fileSize asks f for its current byte size, preferring an explicit
+// Size() int64 method (cachedRWS, mmapFile, memFile) and falling back
+// to Stat() (e.g. *os.File). This avoids wrapping *os.File just to
+// expose a Size method — callers that have one in hand can pass it
+// through directly.
+func fileSize(f any) (int64, error) {
+	if s, ok := f.(interface{ Size() int64 }); ok {
+		return s.Size(), nil
+	}
+	if s, ok := f.(interface{ Stat() (os.FileInfo, error) }); ok {
+		st, err := s.Stat()
+		if err != nil {
+			return 0, err
+		}
+		return st.Size(), nil
+	}
+	return 0, fmt.Errorf("fileSize: %T has no Size or Stat method", f)
+}
+
+// positionMap value packing: upper 17 bits = addIndex, lower 47 bits = position
+// Supports up to 2^47 (~140 trillion) leaves and 2^17 (131,072) adds per block.
+const (
+	positionBits = 47
+	positionMask = (1 << positionBits) - 1
+)
+
+func packPosIndex(pos uint64, addIndex int32) uint64 {
+	return (uint64(uint32(addIndex)) << positionBits) | (pos & positionMask)
+}
+
+func unpackPos(v uint64) uint64  { return v & positionMask }
+func unpackIndex(v uint64) int32 { return int32(v >> positionBits) }
+
+// deletedBitmap tracks deleted leaf positions using 1 bit per position.
+// Position N is stored at bit (N % 64) of bits[N / 64].
+// This is more memory-efficient and cache-friendly than a map.
+//
+// dirtyWords tracks which bitmap words have been modified since the last
+// flush/clear. The WAL uses this to serialize only changed words.
+type deletedBitmap struct {
+	bits       []uint64
+	dirtyWords map[uint64]struct{}
+}
+
+// newDeletedBitmap creates a bitmap sized to track numLeaves positions.
+func newDeletedBitmap(numLeaves uint64) *deletedBitmap {
+	numWords := (numLeaves + 63) / 64
+	return &deletedBitmap{
+		bits:       make([]uint64, numWords),
+		dirtyWords: make(map[uint64]struct{}),
+	}
+}
+
+// set marks the given position as deleted. Grows the bitmap if needed.
+func (b *deletedBitmap) set(pos uint64) {
+	word := pos / 64
+	if word >= uint64(len(b.bits)) {
+		// Double the capacity to amortize growth. During IBD, NumLeaves
+		// increases every block and newly-added leaves may be deleted in
+		// the same block, so positions steadily exceed the initial size.
+		// Without doubling, each new position past the end would copy the
+		// entire bitmap (O(n²) total).
+		newLen := max(
+			uint64(len(b.bits))*2, // amortized doubling
+			max(64, word+1),       // floor of 64 words; at least enough for the requested position
+		)
+		newBits := make([]uint64, newLen)
+		copy(newBits, b.bits)
+		b.bits = newBits
+	}
+	b.bits[word] |= 1 << (pos % 64)
+	b.dirtyWords[word] = struct{}{}
+}
+
+// unset marks the given position as not deleted.
+func (b *deletedBitmap) unset(pos uint64) {
+	word := pos / 64
+	if word >= uint64(len(b.bits)) {
+		return
+	}
+	b.bits[word] &^= 1 << (pos % 64)
+	b.dirtyWords[word] = struct{}{}
+}
+
+// forEachDirty calls fn for each dirty bitmap word, providing the byte offset
+// in the file and the 8-byte little-endian encoded word.
+func (b *deletedBitmap) forEachDirty(fn func(offset int64, data []byte)) {
+	for wordIdx := range b.dirtyWords {
+		// This should never happen in practice since dirtyWords are only
+		// added by set/unset which ensure the index is within bounds.
+		if wordIdx >= uint64(len(b.bits)) {
+			continue
+		}
+		var buf [8]byte
+		binary.LittleEndian.PutUint64(buf[:], b.bits[wordIdx])
+		fn(int64(wordIdx)*8, buf[:])
+	}
+}
+
+// clearDirty resets dirty tracking. Called after WAL flush or discard.
+func (b *deletedBitmap) clearDirty() {
+	clear(b.dirtyWords)
+}
+
+// loadDeletedBitmap reads a bitmap file into a new deletedBitmap.
+// The file stores uint64 words in little-endian format, one per 8 bytes.
+// size is the bitmap file's current byte length.
+func loadDeletedBitmap(file io.ReaderAt, size int64) (*deletedBitmap, error) {
+	if size == 0 {
+		return newDeletedBitmap(0), nil
+	}
+
+	if size%8 != 0 {
+		return nil, fmt.Errorf("bitmap file size %d is not a multiple of 8", size)
+	}
+
+	buf := make([]byte, size)
+	if _, err := file.ReadAt(buf, 0); err != nil && err != io.EOF {
+		return nil, err
+	}
+
+	numWords := uint64(size) / 8
+	// Multiply by 64 to convert from word count to a capacity that
+	// newDeletedBitmap will round back into the correct word count.
+	b := newDeletedBitmap(numWords * 64)
+	for i := range numWords {
+		b.bits[i] = binary.LittleEndian.Uint64(buf[i*8:])
+	}
+
+	return b, nil
+}
+
+// isSet returns true if the given position is marked as deleted.
+func (b *deletedBitmap) isSet(pos uint64) bool {
+	word := pos / 64
+	if word >= uint64(len(b.bits)) {
+		return false
+	}
+	return b.bits[word]&(1<<(pos%64)) != 0
+}
+
+// count returns the total number of deleted positions.
+func (b *deletedBitmap) count() int {
+	n := 0
+	for _, word := range b.bits {
+		n += bits.OnesCount64(word)
+	}
+	return n
+}
+
+// Forest is a Utreexo accumulator backed by a contiguous file.
+// Nodes are stored at row-based offsets computed by posToFileOffset:
+// each row gets a dense section sized by maxFileLeavesBits so that
+// even with forestRows=63 file offsets stay within int64 range.
+// Deleted leaves remain in the file for Undo support.
+//
+// Unlike Pollard which uses pointer-based trees, Forest stores everything
+// in a flat file. Deletions work by copying the sibling hash to the
+// parent position.
+//
+// Forest uses a fixed forestRows to ensure stable position mappings.
+// This is set at creation time based on expected maximum leaves.
+type Forest struct {
+	mu sync.RWMutex // protects all fields below
+
+	file            *cachedRWS
+	blockCountsFile *cachedRWS // stores uint32 add-count per block, 4 bytes each
+	// metaFile holds the forest's persistent metadata as four fixed-size
+	// 32-byte slots, one per field. The slot size matches the fixed record
+	// size the meta cache and the WAL use for this file. A slot past the end
+	// of the file — a fresh database, or one written before the slot existed —
+	// reads as io.EOF with the buffer left zeroed, i.e. the field's zero value.
+	//
+	//	bytes 0-31    recordMode flag: byte 0 is 1 in record mode, else 0
+	//	bytes 32-63   numLeaves: little-endian uint64 in the first 8 bytes
+	//	bytes 64-95   consistency hash: the WAL's committed bestHash
+	//	bytes 96-127  generated leaves: little-endian uint64 in the first 8 bytes
+	//
+	// recordMode, numLeaves and generated leaves are written through the
+	// WAL-protected cachedRWS, so a flush commits them atomically. The
+	// consistency hash is written straight to the underlying file by the WAL's
+	// Flush at bestHashOffset, bypassing the cache. The generated-leaves slot
+	// is RehashAndProve's resume marker; see saveGeneratedLeaves for its
+	// semantics.
+	metaFile   *cachedRWS
+	NumLeaves  uint64
+	forestRows uint8 // Fixed maximum rows for stable position mapping
+
+	// addRehashWindow caps how many appended leaves one rehash pass
+	// materializes. Zero uses defaultAddRehashWindow.
+	addRehashWindow uint64
+
+	// positionMap maps leaf hashes to packed (addIndex, position) values.
+	// Upper 17 bits = addIndex (index within Modify batch), lower 47 bits = position.
+	// Only tracks leaves (row 0), not intermediate nodes.
+	// Uses Swiss Table with mmap'd files for memory efficiency.
+	positionMap PositionMap
+
+	// deletedLeafPositions tracks which leaf positions have been deleted.
+	// Persisted via the WAL (dirty words are serialized during flush).
+	// On restart the bitmap is loaded from the underlying file by the WAL
+	// (or loadDeletedBitmap for non-WAL usage) and passed to newForest.
+	deletedLeafPositions *deletedBitmap
+
+	// recordMode is true after Record is called but before HashAll completes.
+	// Calling Modify while in record mode would corrupt the tree.
+	// Persisted in the metaFile's recordMode slot (see the metaFile field).
+	recordMode bool
+
+	// lastGeneratedLeaves is the leaf count through which the interior hashes
+	// are known current. Any operation that finishes with complete interiors
+	// advances it to NumLeaves — RehashAndProve, Modify, ModifyAndReturnTTLs,
+	// Undo and HashAll. RehashAndProve reads it to rehash only the leaves
+	// appended since the previous pass — a contiguous range whose paths merge
+	// at every row — instead of the whole forest.
+	//
+	// The forest must track this itself rather than take a per-call count
+	// from the caller: Record can run blocks ahead of RehashAndProve when the
+	// two are pipelined, so one pass may cover several blocks of appends and
+	// only the forest knows where the previous pass stopped.
+	//
+	// Persisted through the metaFile's generated-leaves slot, but only when
+	// the interior hashes are fully caught up (see interiorsCurrent). On
+	// open, loadMetadata seeds this field from the slot when the slot
+	// matches the stored numLeaves; otherwise the field stays zero, which
+	// forces the next pass to run from the first leaf, rebuilding every
+	// interior hash from the leaves and the deleted bitmap. That full pass
+	// heals everything a crash can cut off mid-pipeline: appended leaves
+	// whose interiors were never written, and recorded deletions whose
+	// masking walk never ran. Guarded by f.mu.
+	lastGeneratedLeaves uint64
+
+	// unmaskedDels counts deletions Record has marked in the deleted bitmap
+	// whose masking walk has not yet run. An incremental RehashAndProve masks
+	// the pendingDels it is given and subtracts them; a pass from the first
+	// leaf — or HashAll — masks every deleted leaf at the leaf row and zeroes
+	// the count outright, including positions never passed in. The count is
+	// zero exactly when the interior hashes already reflect the bitmap; while
+	// it is nonzero they do not, and saveGeneratedLeaves keeps the
+	// generated-leaves slot at zero. Guarded by f.mu.
+	unmaskedDels uint64
+
+	// wal is set when created via OpenForest; nil for newForest (test/advanced usage).
+	wal *wal
+
+	// closers holds os.File handles to close on Close(). Only set by OpenForest.
+	closers []io.Closer
+}
+
+// readBlockCounts reads all uint32 entries from a block counts file
+// and returns them as a slice. size is the file's current byte length.
+func readBlockCounts(file io.ReaderAt, size int64) ([]uint32, error) {
+	if size == 0 {
+		return nil, nil
+	}
+	if size%4 != 0 {
+		return nil, fmt.Errorf("block counts file size %d is not a multiple of 4", size)
+	}
+	buf := make([]byte, size)
+	if _, err := file.ReadAt(buf, 0); err != nil && err != io.EOF {
+		return nil, err
+	}
+	n := size / 4
+	counts := make([]uint32, n)
+	for i := range counts {
+		counts[i] = binary.LittleEndian.Uint32(buf[i*4:])
+	}
+	return counts, nil
+}
+
+// newForest creates a new Forest backed by the given *cachedRWS files.
+// Production callers obtain these from a WAL via Cached(i); tests use
+// the memCached / wrapMem helpers to wrap an in-memory file.
+// blockCountsFile stores the uint32 add-count per block; numLeaves is derived
+// from the cumulative sum of all block counts.
+// metaFile holds the persistent metadata slots; see the metaFile field for the
+// layout.
+// bitmap tracks deleted leaf positions; pass nil for a fresh forest. When using a WAL,
+// the bitmap is loaded by the WAL after recovery and passed here. For non-WAL usage,
+// load it with loadDeletedBitmap.
+// posMapCtrlPath and posMapSlotsPath are file paths for the Swiss Table position map.
+// forestRows sets the maximum tree height (determines max leaves = 2^forestRows).
+func newForest(file, blockCountsFile, metaFile *cachedRWS, bitmap *deletedBitmap, posMapCtrlPath, posMapSlotsPath string, forestRows uint8, expectedMaxLeaves uint64) (*Forest, error) {
+	return newForestWithPosmap(file, blockCountsFile, metaFile, bitmap, posMapCtrlPath, posMapSlotsPath, forestRows, expectedMaxLeaves, "swiss")
+}
+
+func newForestWithPosmap(file, blockCountsFile, metaFile *cachedRWS, bitmap *deletedBitmap, posMapCtrlPath, posMapSlotsPath string, forestRows uint8, expectedMaxLeaves uint64, posmapKind string) (*Forest, error) {
+	if file == nil || blockCountsFile == nil || metaFile == nil {
+		return nil, fmt.Errorf("one of the given files are nil")
+	}
+
+	f := &Forest{
+		file:            file,
+		blockCountsFile: blockCountsFile,
+		metaFile:        metaFile,
+		forestRows:      forestRows,
+	}
+
+	// Load metadata (recordMode + WAL-protected numLeaves).
+	if err := f.loadMetadata(); err != nil {
+		return nil, fmt.Errorf("load metadata: %w", err)
+	}
+
+	// Reconcile block counts file with WAL-protected numLeaves.
+	// After undo-without-flush crashes, the block counts file may have
+	// stale entries at the end (one per undo). Remove entries from the
+	// end until the sum no longer exceeds numLeaves.
+	bcSize, err := fileSize(blockCountsFile)
+	if err != nil {
+		return nil, fmt.Errorf("blockCountsFile size: %w", err)
+	}
+	counts, err := readBlockCounts(blockCountsFile, bcSize)
+	if err != nil {
+		return nil, fmt.Errorf("read blockCountsFile: %w", err)
+	}
+	var blockTotal uint64
+	for _, c := range counts {
+		blockTotal += uint64(c)
+	}
+	for len(counts) > 0 && blockTotal > f.NumLeaves {
+		blockTotal -= uint64(counts[len(counts)-1])
+		counts = counts[:len(counts)-1]
+	}
+	if err := blockCountsFile.Truncate(int64(len(counts)) * 4); err != nil {
+		return nil, fmt.Errorf("trim block counts: %w", err)
+	}
+
+	// Read the consistency-hash slot from the metaFile (see the metaFile field).
+	// Zero hash on first run or an empty metaFile (io.EOF leaves the buffer zeroed).
+	var consistencyHash [32]byte
+	if _, err := metaFile.ReadAt(consistencyHash[:], bestHashOffset); err != nil && err != io.EOF {
+		return nil, fmt.Errorf("read consistency hash: %w", err)
+	}
+
+	// Create Swiss Table for position map. Size based on numLeaves or
+	// expectedMaxLeaves (whichever is larger) to avoid costly resizes.
+	// When no hint is provided, use a minimum of 1<<16 to avoid excessive
+	// early resizes on a fresh database. Cap at 1<<33 to prevent
+	// accidental multi-hundred-GB allocations.
+	expectedEntries := max(f.NumLeaves, min(expectedMaxLeaves, 1<<33))
+	if expectedMaxLeaves == 0 {
+		expectedEntries = max(expectedEntries, 1<<16)
+	}
+	posMap, needsRebuild, err := newPositionMap(posmapKind, posMapCtrlPath, posMapSlotsPath, expectedEntries, consistencyHash, file, positionMask)
+	if err != nil {
+		return nil, fmt.Errorf("create position map: %w", err)
+	}
+
+	if bitmap == nil {
+		bitmap = newDeletedBitmap(f.NumLeaves)
+	}
+
+	f.positionMap = posMap
+	f.deletedLeafPositions = bitmap
+
+	// Rebuild positionMap only if needed (new file or hash mismatch)
+	if needsRebuild {
+		if err := f.rebuildPositionMap(); err != nil {
+			return nil, fmt.Errorf("rebuild positionMap: %w", err)
+		}
+	}
+
+	return f, nil
+}
+
+// ForestOption configures OpenForest behavior.
+type ForestOption func(*forestOptions)
+
+type forestOptions struct {
+	maxCacheMemory    int64
+	expectedMaxLeaves uint64
+	posmapKind        string
+}
+
+// PositionMapKind selects the position-map implementation used by the Forest.
+// "swiss" (default) uses the production Swiss Table; "lh" uses the alternative
+// linear-hashing map (bench/l2-forest).
+func PositionMapKind(kind string) ForestOption {
+	return func(o *forestOptions) {
+		o.posmapKind = kind
+	}
+}
+
+// MaxCacheMemory sets the total WAL cache memory budget in bytes.
+// The budget is split proportionally across files by entry size.
+// If zero or not set, each file uses the WAL default (64MB).
+func MaxCacheMemory(bytes int64) ForestOption {
+	return func(o *forestOptions) {
+		o.maxCacheMemory = bytes
+	}
+}
+
+// ExpectedMaxLeaves sets the expected maximum number of leaves for presizing
+// the position map. This avoids costly resizes during initial sync. If zero
+// or not set, the position map is sized based on the current NumLeaves.
+func ExpectedMaxLeaves(n uint64) ForestOption {
+	return func(o *forestOptions) {
+		o.expectedMaxLeaves = n
+	}
+}
+
+// OpenForest opens a file-backed Forest at the given directory path,
+// creating it if it doesn't exist. It sets up a WAL with default cache
+// sizes and wires up the OnFlush callback for position map syncing.
+//
+// Use Close() to flush pending data and release file handles.
+// For custom cache sizes or in-memory usage within the package/tests, use newForest.
+func OpenForest(dbpath string, opts ...ForestOption) (*Forest, error) {
+	var o forestOptions
+	for _, opt := range opts {
+		opt(&o)
+	}
+
+	if err := os.MkdirAll(dbpath, 0700); err != nil {
+		return nil, fmt.Errorf("create dbpath: %w", err)
+	}
+
+	fileNames := []string{
+		forestDataFileName,
+		forestDeletedFileName,
+		forestBlockCountsFileName,
+		forestJournalFileName,
+		forestMetaFileName,
+	}
+
+	files := make([]*os.File, 0, len(fileNames))
+	for _, name := range fileNames {
+		f, err := os.OpenFile(filepath.Join(dbpath, name), os.O_RDWR|os.O_CREATE, 0600)
+		if err != nil {
+			for _, prev := range files {
+				prev.Close()
+			}
+			return nil, fmt.Errorf("open %s: %w", name, err)
+		}
+		files = append(files, f)
+	}
+
+	dataFile, deletedFile, blockCountsFile, journalFile, metaFile := files[0], files[1], files[2], files[3], files[4]
+	closers := make([]io.Closer, len(files))
+	for i, f := range files {
+		closers[i] = f
+	}
+
+	// Ensure the data file spans the full compact row layout before the
+	// WAL wraps it, so the cachedRWS layer sees the correct file size.
+	// On filesystems with sparse-file support only written blocks
+	// consume physical disk space.
+	totalSize := dataFileSize(defaultForestRows)
+	if err := dataFile.Truncate(totalSize); err != nil {
+		for _, c := range closers {
+			c.Close()
+		}
+		return nil, fmt.Errorf("truncate data file: %w", err)
+	}
+
+	// On unix this memory-maps the data file for faster I/O; on other
+	// platforms it falls back to the raw *os.File. The file has been
+	// pre-sized above and is never resized, so the mapping is stable.
+	dataFF, err := mmapfile.Open(dataFile, totalSize)
+	if err != nil {
+		for _, c := range closers {
+			c.Close()
+		}
+		return nil, fmt.Errorf("open data file: %w", err)
+	}
+	closers[0] = dataFF
+
+	// The block counts file is tiny (~4 bytes per block, ~3.6 MB at 900K blocks)
+	// so it doesn't need a significant cache budget. Allocate the full memory
+	// budget to the data file cache. Meta and block counts use WAL defaults.
+	const (
+		dataEntrySize        = 32
+		blockCountsEntrySize = 4
+		metaEntrySize        = 32
+	)
+	var dataCacheBytes int64
+	if o.maxCacheMemory > 0 {
+		dataCacheBytes = o.maxCacheMemory
+	}
+
+	wal, err := newWAL(journalFile, rawFile{deletedFile},
+		walFile{File: dataFF, EntrySize: dataEntrySize, MaxCacheBytes: dataCacheBytes},
+		walFile{File: rawFile{blockCountsFile}, EntrySize: blockCountsEntrySize},
+		walFile{File: rawFile{metaFile}, EntrySize: metaEntrySize},
+	)
+	if err != nil {
+		for _, c := range closers {
+			c.Close()
+		}
+		return nil, fmt.Errorf("create wal: %w", err)
+	}
+
+	ctrlPath := filepath.Join(dbpath, forestPosMapCtrlFileName)
+	slotsPath := filepath.Join(dbpath, forestPosMapSlotsFileName)
+
+	f, err := newForestWithPosmap(
+		wal.Cached(0), wal.Cached(1), wal.Cached(2),
+		wal.Bitmap(),
+		ctrlPath, slotsPath,
+		defaultForestRows,
+		o.expectedMaxLeaves,
+		o.posmapKind,
+	)
+	if err != nil {
+		for _, c := range closers {
+			c.Close()
+		}
+		return nil, fmt.Errorf("create forest: %w", err)
+	}
+
+	wal.SetOnFlush(func(hash [32]byte) error {
+		return f.SyncPositionMap(hash)
+	})
+
+	f.wal = wal
+	f.closers = closers
+
+	return f, nil
+}
+
+// Flush atomically commits all cached writes through the WAL journal.
+// Only valid on forests created via OpenForest.
+//
+// Acquires f.mu to serialize against concurrent readers and writers of the
+// deletedLeafPositions bitmap: Record mutates it under f.mu and the WAL
+// iterates it while serializing, while RehashAndProve reads it. Without the
+// lock a periodic flush could race those accesses.
+func (f *Forest) Flush(bestHash [32]byte) error {
+	if f.wal == nil {
+		return fmt.Errorf("flush: no WAL (use OpenForest to enable)")
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.wal.Flush(bestHash)
+}
+
+// FlushNeeded returns true if any cached file has exceeded its memory threshold.
+// Always returns false for forests without a WAL.
+func (f *Forest) FlushNeeded() bool {
+	if f.wal == nil {
+		return false
+	}
+	return f.wal.FlushNeeded()
+}
+
+// Close flushes pending writes and closes the position map and all
+// underlying file handles. bestHash is the consistency hash written
+// to the WAL during the final flush.
+func (f *Forest) Close(bestHash [32]byte) error {
+	var firstErr error
+	if f.wal != nil {
+		if err := f.wal.Flush(bestHash); err != nil {
+			firstErr = err
+		}
+		f.wal.Close()
+	}
+	if err := f.positionMap.Close(); err != nil && firstErr == nil {
+		firstErr = err
+	}
+	for _, c := range f.closers {
+		if err := c.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	f.closers = nil
+	return firstErr
+}
+
+// rebuildPositionMap reads all leaf hashes in batches and populates the
+// positionMap. The addIndex for each leaf is derived from the block counts
+// file using a linear scan (sequential access pattern).
+func (f *Forest) rebuildPositionMap() error {
+	if f.NumLeaves == 0 {
+		return nil
+	}
+
+	// Load block counts from file into a local slice.
+	bcSize, err := fileSize(f.blockCountsFile)
+	if err != nil {
+		return fmt.Errorf("blockCountsFile size: %w", err)
+	}
+	blockAdds, err := readBlockCounts(f.blockCountsFile, bcSize)
+	if err != nil {
+		return fmt.Errorf("read block counts: %w", err)
+	}
+
+	const batchSize = 4096 // entries per batch
+	type batch struct {
+		pos  uint64
+		size uint64
+		data []byte
+	}
+
+	// done is closed on any error to signal the producer goroutine to exit.
+	done := make(chan struct{})
+	defer close(done)
+
+	hashCh := make(chan batch, 4)
+	hashErrCh := make(chan error, 1)
+
+	go func() {
+		defer close(hashCh)
+
+		for pos := uint64(0); pos < f.NumLeaves; pos += batchSize {
+			n := min(uint64(batchSize), f.NumLeaves-pos)
+
+			buf := make([]byte, n*32)
+			if _, err := f.file.ReadAt(buf, f.posToFileOffset(pos)); err != nil {
+				hashErrCh <- err
+				return
+			}
+
+			select {
+			case hashCh <- batch{pos: pos, size: n, data: buf}:
+			case <-done:
+				hashErrCh <- nil
+				return
+			}
+		}
+		hashErrCh <- nil
+	}()
+
+	// Linear scan: advance blockIdx as leafPos crosses block boundaries.
+	blockIdx := 0
+	blockStart := uint64(0)
+
+	for hashBatch := range hashCh {
+		for i := uint64(0); i < hashBatch.size; i++ {
+			leafPos := hashBatch.pos + i
+
+			// Advance to the block containing leafPos.
+			for blockIdx < len(blockAdds) && blockStart+uint64(blockAdds[blockIdx]) <= leafPos {
+				blockStart += uint64(blockAdds[blockIdx])
+				blockIdx++
+			}
+			addIndex := int32(leafPos - blockStart)
+
+			var hash Hash
+			copy(hash[:], hashBatch.data[i*32:])
+
+			if hash == empty {
+				continue
+			}
+
+			if err := f.positionMap.Set(hash, packPosIndex(leafPos, addIndex)); err != nil {
+				return fmt.Errorf("positionMap.Set at %d: %w", leafPos, err)
+			}
+		}
+	}
+
+	// Check the hash reader for errors.
+	if err := <-hashErrCh; err != nil {
+		return fmt.Errorf("read hashes: %w", err)
+	}
+
+	return nil
+}
+
+// loadMetadata reads the recordMode, numLeaves and generated-leaves slots from
+// the metaFile (see the metaFile field for the layout). The consistency-hash
+// slot is read separately by OpenForest.
+func (f *Forest) loadMetadata() error {
+	// readSlot reads one 32-byte metadata slot. present is false when the slot is
+	// absent: a fresh database, or a meta file written before the slot existed.
+	readSlot := func(offset int64) (slot [32]byte, present bool, err error) {
+		n, err := f.metaFile.ReadAt(slot[:], offset)
+		if err == io.EOF {
+			return slot, n == len(slot), nil
+		}
+		return slot, err == nil, err
+	}
+
+	recordModeSlot, _, err := readSlot(0)
+	if err != nil {
+		return err
+	}
+	f.recordMode = recordModeSlot[0] != 0
+
+	numLeavesSlot, _, err := readSlot(32)
+	if err != nil {
+		return err
+	}
+	if metaLeaves := binary.LittleEndian.Uint64(numLeavesSlot[:8]); metaLeaves > 0 {
+		f.NumLeaves = metaLeaves
+	}
+
+	genSlot, genPresent, err := readSlot(generatedLeavesOffset)
+	if err != nil {
+		return err
+	}
+	if !genPresent {
+		// Legacy meta file with no slot. Normal mode is always caught up, so seed
+		// lastGeneratedLeaves from numLeaves. Record mode stays at 0 to rebuild.
+		if !f.recordMode {
+			f.lastGeneratedLeaves = f.NumLeaves
+		}
+		return nil
+	}
+
+	// A nonzero slot means no append cleared it (Record clears it), so every
+	// append since built its parent hashes and the forest is caught up: seed
+	// lastGeneratedLeaves from numLeaves, like the legacy path above. A zero slot
+	// or one ahead of numLeaves rebuilds from the first leaf.
+	if gen := binary.LittleEndian.Uint64(genSlot[:8]); gen != 0 && gen <= f.NumLeaves {
+		f.lastGeneratedLeaves = f.NumLeaves
+	}
+	return nil
+}
+
+// saveRecordMode writes the recordMode flag to its metaFile slot (see the
+// metaFile field). The write goes through the WAL-protected cachedRWS, so it
+// is crash-safe.
+func (f *Forest) saveRecordMode() error {
+	var recordModeBuf [32]byte
+	if f.recordMode {
+		recordModeBuf[0] = 1
+	}
+	return f.metaFile.PutHashAt(recordModeBuf, 0)
+}
+
+// saveNumLeaves writes numLeaves to its metaFile slot (see the metaFile field).
+// The write goes through the WAL-protected cachedRWS, so it is crash-safe.
+func (f *Forest) saveNumLeaves() error {
+	var numLeavesBuf [32]byte
+	binary.LittleEndian.PutUint64(numLeavesBuf[:], f.NumLeaves)
+	return f.metaFile.PutHashAt(numLeavesBuf, 32)
+}
+
+// interiorsCurrent reports whether every interior hash matches the leaves and
+// the deleted bitmap: the last rehash pass covered all leaves and no recorded
+// deletion is awaiting its masking walk.
+func (f *Forest) interiorsCurrent() bool {
+	return f.lastGeneratedLeaves == f.NumLeaves && f.unmaskedDels == 0
+}
+
+// clearGeneratedLeaves zeroes the generated-leaves slot of the metaFile.
+// Mutating operations call it before their first write so that an error
+// return part way through never leaves a slot claiming the interior hashes
+// are complete; the operations that finish with complete interiors write the
+// slot back via saveGeneratedLeaves.
+func (f *Forest) clearGeneratedLeaves() error {
+	var zero [32]byte
+	return f.metaFile.PutHashAt(zero, generatedLeavesOffset)
+}
+
+// saveGeneratedLeaves writes the generated-leaves slot of the metaFile:
+// NumLeaves when the interior hashes are current (see interiorsCurrent) and
+// zero otherwise. The write goes through the WAL-protected cachedRWS, so a
+// flush commits the slot atomically with the leaves, bitmap and numLeaves it
+// describes. A stored slot that matches the stored numLeaves therefore proves
+// the stored interior hashes are complete, which lets loadMetadata seed
+// lastGeneratedLeaves and the next rehash pass skip the full rebuild.
+func (f *Forest) saveGeneratedLeaves() error {
+	var buf [32]byte
+	if f.interiorsCurrent() {
+		binary.LittleEndian.PutUint64(buf[:], f.NumLeaves)
+	}
+	// When the parent hashes are not current, buf stays zero, so the slot is
+	// set to zero rather than left untouched. This way the call alone fully
+	// determines the slot's committed value, without relying on a preceding
+	// clearGeneratedLeaves call, so no path can leave a stale nonzero slot that
+	// wrongly claims the parent hashes are complete.
+	return f.metaFile.PutHashAt(buf, generatedLeavesOffset)
+}
+
+// ReadConsistencyHash reads the consistency-hash slot from the metaFile (see
+// the metaFile field). The hash is written atomically by WAL.Flush(). Returns
+// a zero hash on a fresh database where the metaFile has not yet been written
+// that far.
+//
+// Takes f.mu to serialize the metaFile read against a concurrent Flush, which
+// holds the write lock while WAL.Flush rewrites the meta cache and its size
+// tracking.
+func (f *Forest) ReadConsistencyHash() ([32]byte, error) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+
+	var hash [32]byte
+	_, err := f.metaFile.ReadAt(hash[:], bestHashOffset)
+	if err == io.EOF {
+		return hash, nil
+	}
+	return hash, err
+}
+
+// GetNumLeaves returns the total number of leaves added to the forest.
+//
+// This function is safe for concurrent access.
+func (f *Forest) GetNumLeaves() uint64 {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return f.NumLeaves
+}
+
+// GetTreeRows returns the fixed number of rows in the forest.
+//
+// This function is safe for concurrent access.
+func (f *Forest) GetTreeRows() uint8 {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return TreeRows(f.NumLeaves)
+}
+
+// SyncPositionMap updates the stored consistency hash in the position map.
+// It first fsyncs the mmap'd ctrl and slots files to make all pending position
+// map writes durable, then writes the consistency hash into both file headers
+// and fsyncs again. Call this after WAL flush succeeds to enable skipping
+// rebuild on restart.
+func (f *Forest) SyncPositionMap(consistencyHash [32]byte) error {
+	return f.positionMap.SetConsistencyHash(consistencyHash)
+}
+
+// posToFileOffset translates a tree position to a byte offset in the
+// data file.  Each row is stored in a dense section whose start is
+// precomputed in rowBase; the offset within the row is the distance
+// from the row's first position.
+func (f *Forest) posToFileOffset(position uint64) int64 {
+	row := DetectRow(position, f.forestRows)
+	rowStart := startPositionAtRow(row, f.forestRows)
+	return rowBaseOffset(row, f.forestRows) + int64(position-rowStart)*32
+}
+
+// readHash reads the hash at the given position from the file using ReadAt.
+// Positions that have never been written (read past EOF) yield a zero Hash,
+// matching the forest's "unwritten = empty" semantics.
+// Safe for concurrent use with other readHash/writeHash calls on disjoint
+// positions (no shared seek position).
+func (f *Forest) readHash(position uint64) (Hash, error) {
+	offset := f.posToFileOffset(position)
+	var hash Hash
+	_, err := f.file.ReadAt(hash[:], offset)
+	if err == io.EOF {
+		return Hash{}, nil
+	}
+	if err != nil {
+		return Hash{}, err
+	}
+	return hash, nil
+}
+
+// writeHash writes the hash at the given position to the file using WriteAt.
+// Safe for concurrent use with other readHash/writeHash calls on disjoint
+// positions (no shared seek position).
+func (f *Forest) writeHash(position uint64, hash Hash) error {
+	offset := f.posToFileOffset(position)
+	_, err := f.file.WriteAt(hash[:], offset)
+	return err
+}
+
+// appendBlockCount appends a block's add count to the block counts file.
+func (f *Forest) appendBlockCount(count uint32) error {
+	off, err := fileSize(f.blockCountsFile)
+	if err != nil {
+		return err
+	}
+	return f.blockCountsFile.PutUint32At(count, off)
+}
+
+// add adds a single leaf to the forest.
+// If hash is empty, the sibling (existing root) moves up to the parent position.
+func (f *Forest) add(hash Hash, addIndex int32) error {
+	// Add to position map (before incrementing NumLeaves). Empty leaves are
+	// not tracked: they exist only to mask out a position.
+	if hash != empty {
+		if err := f.positionMap.Set(hash, packPosIndex(f.NumLeaves, addIndex)); err != nil {
+			return fmt.Errorf("positionMap.Set: %w", err)
+		}
+	}
+
+	// Write the leaf hash at position NumLeaves. Empty hashes are written
+	// too: the leaf row is the ground truth every rebuild reads, and the
+	// slot may hold a stale hash from an earlier occupant (Undo removes a
+	// leaf from the position map without clearing its slot).
+	if err := f.writeHash(f.NumLeaves, hash); err != nil {
+		return fmt.Errorf("write leaf: %w", err)
+	}
+
+	currentHash := hash
+	currentPos := f.NumLeaves
+
+	// Hash with existing roots based on binary representation of NumLeaves.
+	// Wherever there's a 1 bit, there's an existing root to hash with.
+	for h := uint8(0); (f.NumLeaves>>h)&1 == 1; h++ {
+		// Get the existing root position at row h
+		rootPos := rootPosition(f.NumLeaves, h, f.forestRows)
+
+		// Read the existing root hash
+		rootHash, err := f.readHash(rootPos)
+		if err != nil {
+			return fmt.Errorf("read root at row %d: %w", h, err)
+		}
+
+		// Check if this root is a deleted leaf - treat as empty if so
+		if f.deletedLeafPositions.isSet(rootPos) {
+			rootHash = empty
+		}
+
+		// Calculate parent position
+		parentPos := Parent(currentPos, f.forestRows)
+
+		// Handle empty hashes using parentHash logic
+		newHash := parentHash(rootHash, currentHash)
+
+		// Write the parent hash
+		err = f.writeHash(parentPos, newHash)
+		if err != nil {
+			return fmt.Errorf("write parent at position %d: %w", parentPos, err)
+		}
+
+		currentHash = newHash
+		currentPos = parentPos
+	}
+
+	f.NumLeaves++
+	return nil
+}
+
+func (f *Forest) deleteSingle(delHash Hash) error {
+	// Get the packed value (contains position + addIndex)
+	packed, _, err := f.positionMap.Get(delHash)
+	if err != nil {
+		return fmt.Errorf("positionMap.Get: %w", err)
+	}
+	leafPos := unpackPos(packed)
+
+	// Mark position as deleted in the in-memory bitmap.
+	// The WAL will persist dirty bitmap words during flush.
+	f.deletedLeafPositions.set(leafPos)
+
+	// First I need to check if I moved up.
+	pos := leafPos
+	parentPos := Parent(pos, f.forestRows)
+	pHash, err := f.readHash(parentPos)
+	if err != nil {
+		return err
+	}
+
+	for pHash == delHash {
+		pos = parentPos
+		parentPos = Parent(pos, f.forestRows)
+		pHash, err = f.readHash(parentPos)
+		if err != nil {
+			return err
+		}
+	}
+
+	if isRootPositionTotalRows(pos, f.NumLeaves, f.forestRows) {
+		row := DetectRow(pos, f.forestRows)
+		if row == 0 {
+			// Don't overwrite - just mark as deleted (already done above).
+			// The hash is preserved for undo. GetRoots will return empty for deleted roots.
+		} else {
+			err = f.writeHash(pos, empty)
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	sibPos := sibling(pos)
+	sibHash, err := f.readHash(sibPos)
+	if err != nil {
+		return err
+	}
+
+	// Then I write my hash.
+	err = f.writeHash(parentPos, sibHash)
+	if err != nil {
+		return err
+	}
+	sibHashPos := parentPos // track where sibHash is written
+
+	// After that, I need to check if my parents moved up.
+	parentPos = Parent(parentPos, f.forestRows)
+	curHash := pHash
+	pHash, err = f.readHash(parentPos)
+	if err != nil {
+		return err
+	}
+
+	for curHash == pHash {
+		err = f.writeHash(parentPos, sibHash)
+		if err != nil {
+			return err
+		}
+		sibHashPos = parentPos // update position where sibHash lives
+		parentPos = Parent(parentPos, f.forestRows)
+		pHash, err = f.readHash(parentPos)
+		if err != nil {
+			return err
+		}
+	}
+
+	err = f.rehashToRoot(sibHashPos, sibHash)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// rehashToRoot rehashes from the given position up to the root.
+// The hash at pos is provided to avoid an extra read.
+func (f *Forest) rehashToRoot(pos uint64, hash Hash) error {
+	currentHash := hash
+	// Track the original hash at our position (before any writes).
+	// This is used to detect if sibling was deleted: if parent == originalPosHash,
+	// it means our old hash moved up when sibling was deleted.
+	originalPosHash := hash
+
+	for !isRootPositionTotalRows(pos, f.NumLeaves, f.forestRows) {
+		parentPos := Parent(pos, f.forestRows)
+		parentH, err := f.readHash(parentPos)
+		if err != nil {
+			return fmt.Errorf("read parent at %d: %w", parentPos, err)
+		}
+
+		// Check if sibling was deleted: if parent contains our original hash,
+		// it means our hash moved up when sibling was deleted.
+		// We should just propagate currentHash up (continue the move-up).
+		if parentH == originalPosHash {
+			err = f.writeHash(parentPos, currentHash)
+			if err != nil {
+				return fmt.Errorf("write parent at %d: %w", parentPos, err)
+			}
+			// For next iteration: the original hash at parentPos was parentH (= originalPosHash)
+			// Since we moved up, the chain continues
+			originalPosHash = parentH
+			pos = parentPos
+			continue
+		}
+
+		sibPos := sibling(pos)
+		sibHash, err := f.readHash(sibPos)
+		if err != nil {
+			return fmt.Errorf("read sibling at %d: %w", sibPos, err)
+		}
+
+		var newParentHash Hash
+		if isLeftNiece(pos) {
+			newParentHash = parentHash(currentHash, sibHash)
+		} else {
+			newParentHash = parentHash(sibHash, currentHash)
+		}
+
+		// Save the old parent hash before overwriting - we need it for next iteration's check
+		oldParentH := parentH
+
+		err = f.writeHash(parentPos, newParentHash)
+		if err != nil {
+			return fmt.Errorf("write parent at %d: %w", parentPos, err)
+		}
+
+		pos = parentPos
+		currentHash = newParentHash
+		originalPosHash = oldParentH // This was at pos before we wrote
+	}
+
+	return nil
+}
+
+// GetRoots returns the current root hashes of the forest.
+// Implements the ToString interface.
+//
+// This function is safe for concurrent access.
+func (f *Forest) GetRoots() []Hash {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	roots, _, _ := f.getRoots(f.NumLeaves)
+	return roots
+}
+
+// getRoots reads the hashes at the forest's root positions for numLeaves,
+// yielding empty for a root that is itself a leaf marked deleted.
+//
+// This function is NOT safe for concurrent access.
+func (f *Forest) getRoots(numLeaves uint64) ([]Hash, uint64, error) {
+	rootPositions := RootPositions(numLeaves, f.forestRows)
+	roots := make([]Hash, len(rootPositions))
+	for i, pos := range rootPositions {
+		if f.deletedLeafPositions.isSet(pos) {
+			roots[i] = empty
+			continue
+		}
+		hash, err := f.readHashAt(pos)
+		if err != nil {
+			return nil, 0, fmt.Errorf("read root at position %d: %w", pos, err)
+		}
+		roots[i] = hash
+	}
+
+	return roots, numLeaves, nil
+}
+
+// getHash returns the hash at the logical position of the forest.
+//
+// This function is NOT safe for concurrent access.
+func (f *Forest) getHash(pos uint64) Hash {
+	// Tree is the root the position is located under.
+	// branchLen denotes how far down the root the position is.
+	// bits tell us if we should go down to the left child or the right child.
+	if pos >= maxPosition(TreeRows(f.NumLeaves)) {
+		return empty
+	}
+	tree, branchLen, _, err := DetectOffset(pos, f.NumLeaves, TreeRows(f.NumLeaves))
+	if err != nil {
+		return empty
+	}
+	if tree >= numRoots(f.NumLeaves) {
+		return empty
+	}
+
+	startPos := RootPositions(f.NumLeaves, f.forestRows)[tree]
+	startHash, err := f.readHash(startPos)
+	if err != nil {
+		return empty
+	}
+
+	// If the root is empty, then everything else is empty.
+	if startHash == empty {
+		return empty
+	}
+
+	// If the root is at row 0, check if it's been deleted as the hash will not be empty.
+	if DetectRow(startPos, f.forestRows) == 0 {
+		if f.deletedLeafPositions.isSet(startPos) {
+			return empty
+		}
+
+		// If the hash isn't empty we can just return here.
+		return startHash
+	}
+
+	for h := int(branchLen) - 1; h >= 0; h-- {
+		// If we're at this stage, that means we need to go down. But if the position is at row 0,
+		// we can't go down any further.  This indicates that the position is already deleted.
+		if DetectRow(startPos, f.forestRows) == 0 {
+			return empty
+		}
+
+		lChildHash, err := f.readHash(LeftChild(startPos, f.forestRows))
+		if err != nil {
+			return empty
+		}
+		rChildHash, err := f.readHash(RightChild(startPos, f.forestRows))
+		if err != nil {
+			return empty
+		}
+
+		// Skip a branch if the hashes are the same. This means that the current root doesn't actually exist.
+		switch startHash {
+		case lChildHash:
+			startPos = LeftChild(startPos, f.forestRows)
+			startHash = lChildHash
+			h++
+
+			continue
+
+		case rChildHash:
+			startPos = RightChild(startPos, f.forestRows)
+			startHash = rChildHash
+			h++
+
+			continue
+		}
+
+		// Figure out which node we need to follow.
+		childPos := uint8(pos>>h) & 1
+		if isLeftNiece(uint64(childPos)) {
+			startPos = LeftChild(startPos, f.forestRows)
+			startHash = lChildHash
+		} else {
+			startPos = RightChild(startPos, f.forestRows)
+			startHash = rChildHash
+		}
+	}
+
+	return startHash
+}
+
+// GetHash returns the hash at the given position in defaultForestRows space.
+// Implements the ToString interface for debugging.
+// Traverses from root to target position, following the tree structure
+// and handling move-ups where a child's hash equals its parent's hash.
+//
+// This function is safe for concurrent access.
+func (f *Forest) GetHash(position uint64) Hash {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+
+	treeRows := TreeRows(f.NumLeaves)
+	if treeRows != defaultForestRows {
+		position = translatePos(position, defaultForestRows, treeRows)
+	}
+	return f.getHash(position)
+}
+
+// Undo reverts a modification done by Modify.
+// This implements the Utreexo interface.
+//
+// This function is safe for concurrent access.
+func (f *Forest) Undo(prevAdds []Hash, proof Proof, delHashes, prevRoots []Hash) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if f.recordMode {
+		return fmt.Errorf("cannot call Undo while in record mode; call HashAll first")
+	}
+
+	mutating := len(prevAdds) > 0 || len(delHashes) > 0
+
+	// An undo reverts the existing parent hashes rather than rebuilding them,
+	// so like modifyInternal it is only correct when those hashes are current.
+	// Reject it otherwise so stale hashes are never baked into new parents.
+	if mutating && !f.interiorsCurrent() {
+		return fmt.Errorf("cannot undo a block over stale parent hashes, run HashAll first")
+	}
+
+	// Clear the slot before the first write so an error part way through never
+	// leaves a completeness claim over partially written parent hashes.
+	if mutating {
+		if err := f.clearGeneratedLeaves(); err != nil {
+			return fmt.Errorf("clear generated leaves: %w", err)
+		}
+	}
+
+	if err := f.undoInternal(uint64(len(prevAdds)), delHashes); err != nil {
+		// The parent hash writes may have landed partially, so treat them as
+		// unbuilt and let the next rehash pass run from the first leaf.
+		f.lastGeneratedLeaves = 0
+		return err
+	}
+
+	if !mutating {
+		return nil
+	}
+	// The guard above ran with the parent hashes current and the undo left
+	// them covering every remaining leaf.
+	f.lastGeneratedLeaves = f.NumLeaves
+	return f.saveGeneratedLeaves()
+}
+
+// undoInternal reverts additions and deletions.
+// numAdds is how many leaves were added in the block being undone.
+// delHashes are the hashes that were deleted in the block being undone;
+// their positions are looked up from positionMap.
+func (f *Forest) undoInternal(numAdds uint64, delHashes []Hash) error {
+	// Step 1: Undo additions - delete from positionMap before decrementing NumLeaves.
+	for i := range numAdds {
+		pos := f.NumLeaves - numAdds + i
+		hash, err := f.readHash(pos)
+		if err != nil {
+			return fmt.Errorf("read hash at %d for undo add: %w", pos, err)
+		}
+		// An empty hash is a leaf that was added as empty; add never
+		// entered it into the position map.
+		if hash == empty {
+			continue
+		}
+		if _, err := f.positionMap.Delete(hash); err != nil {
+			return fmt.Errorf("positionMap.Delete at %d: %w", pos, err)
+		}
+	}
+	f.NumLeaves -= numAdds
+
+	// Persist the decremented numLeaves through the WAL-protected meta file.
+	// The stale block counts entry is left on disk; it will be trimmed on
+	// the next startup if a crash occurs before the next flush.
+	if err := f.saveNumLeaves(); err != nil {
+		return fmt.Errorf("save num leaves: %w", err)
+	}
+
+	// Step 2: Look up deleted positions from positionMap
+	delPositions := make([]uint64, len(delHashes))
+	for i, hash := range delHashes {
+		packed, found, err := f.positionMap.Get(hash)
+		if err != nil {
+			return fmt.Errorf("positionMap.Get for undo del: %w", err)
+		}
+		if !found {
+			return fmt.Errorf("hash not found in positionMap for undo")
+		}
+		delPositions[i] = unpackPos(packed)
+	}
+
+	// Step 3: Undo deletions in reverse order (LIFO)
+	for i := len(delPositions) - 1; i >= 0; i-- {
+		pos := delPositions[i]
+		f.deletedLeafPositions.unset(pos)
+
+		err := f.undoSingleDeletion(pos)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (f *Forest) undoSingleDeletion(pos uint64) error {
+	if isRootPositionTotalRows(pos, f.NumLeaves, f.forestRows) {
+		return nil
+	}
+
+	// Undoing a single deletion is in 5 steps,
+	//
+	// 1: We grab the current position of the deleted hash as it may have moved up.
+	// 2: We calculate the parent hash with the sibling (calculated from the current position).
+	// 3: We insert the parent hash into the parent position.
+	// 4: We check if the old hash in the parent position moved up as well, inserting theh parent hash
+	//    whereever needed.
+	// 5: From the last position we've inserted the parent hash (calculated in 3), we rehash to the root
+	//    (while keeping in mind to move up hashes if the sibling is deleted).
+	hash, err := f.readHash(pos)
+	if err != nil {
+		return err
+	}
+
+	parentPos := Parent(pos, f.forestRows)
+	pHash, err := f.readHash(parentPos)
+	if err != nil {
+		return err
+	}
+
+	for pHash == hash {
+		pos = parentPos
+		parentPos = Parent(pos, f.forestRows)
+		pHash, err = f.readHash(parentPos)
+		if err != nil {
+			return err
+		}
+	}
+
+	// Check if we already wrote to the root.
+	if isRootPositionTotalRows(parentPos, f.NumLeaves, f.forestRows) {
+		pHash, err := f.readHash(parentPos)
+		if err != nil {
+			return err
+		}
+
+		// If the parent is a root and it's empty, that means my sib got deleted too.
+		if pHash == empty {
+			err = f.writeHash(parentPos, hash)
+			return err
+		}
+	}
+
+	sibPos := sibling(pos)
+	sibHash, err := f.readHash(sibPos)
+	if err != nil {
+		return err
+	}
+
+	// Calculate parent hash (order depends on left/right)
+	var newParentHash Hash
+	if isLeftNiece(pos) {
+		newParentHash = parentHash(hash, sibHash)
+	} else {
+		newParentHash = parentHash(sibHash, hash)
+	}
+
+	lastWritePos := parentPos
+	prevHash := pHash
+
+	err = f.writeHash(lastWritePos, newParentHash)
+	if err != nil {
+		return err
+	}
+
+	// Check if we already wrote to the root
+	if isRootPositionTotalRows(lastWritePos, f.NumLeaves, f.forestRows) {
+		return nil
+	}
+
+	parentPos = Parent(lastWritePos, f.forestRows)
+	pHash, err = f.readHash(parentPos)
+	if err != nil {
+		return err
+	}
+
+	// Step 4: Check if the old hash in the parent position moved up as well
+	for prevHash == pHash {
+		err = f.writeHash(parentPos, newParentHash)
+		if err != nil {
+			return err
+		}
+		lastWritePos = parentPos
+
+		if isRootPositionTotalRows(parentPos, f.NumLeaves, f.forestRows) {
+			return nil
+		}
+
+		parentPos = Parent(parentPos, f.forestRows)
+		pHash, err = f.readHash(parentPos)
+		if err != nil {
+			return err
+		}
+	}
+
+	// Step 5: Rehash from the last write position to the root
+	return f.rehashToRootFromPos(lastWritePos)
+}
+
+// rehashToRootFromPos recalculates hashes from the given position up to its root.
+func (f *Forest) rehashToRootFromPos(pos uint64) error {
+	currentPos := pos
+
+	for !isRootPositionTotalRows(currentPos, f.NumLeaves, f.forestRows) {
+		// Read current hash
+		currentHash, err := f.readHash(currentPos)
+		if err != nil {
+			return fmt.Errorf("read current at %d: %w", currentPos, err)
+		}
+
+		parentPos := Parent(currentPos, f.forestRows)
+		parentH, err := f.readHash(parentPos)
+		if err != nil {
+			return fmt.Errorf("read parent at %d: %w", parentPos, err)
+		}
+
+		// If parent equals current hash, this node has "moved up" due to sibling deletion.
+		// Skip this level - the hash is already in the right place.
+		if parentH == currentHash {
+			currentPos = parentPos
+			continue
+		}
+
+		// Read sibling hash
+		sibPos := sibling(currentPos)
+		sibHash, err := f.readHash(sibPos)
+		if err != nil {
+			return fmt.Errorf("read sibling at %d: %w", sibPos, err)
+		}
+
+		// Calculate parent hash (order depends on left/right)
+		var newParentHash Hash
+		if isLeftNiece(currentPos) {
+			newParentHash = parentHash(currentHash, sibHash)
+		} else {
+			newParentHash = parentHash(sibHash, currentHash)
+		}
+
+		// Write to parent
+		err = f.writeHash(parentPos, newParentHash)
+		if err != nil {
+			return fmt.Errorf("write parent at %d: %w", parentPos, err)
+		}
+
+		currentPos = parentPos
+
+		prevHash := parentH
+		parentPos = Parent(parentPos, f.forestRows)
+		parentH, err = f.readHash(parentPos)
+		if err != nil {
+			return fmt.Errorf("read parent at %d: %w", parentPos, err)
+		}
+		for prevHash == parentH {
+			// Write to parent
+			err = f.writeHash(parentPos, newParentHash)
+			if err != nil {
+				return fmt.Errorf("write parent at %d: %w", parentPos, err)
+			}
+
+			currentPos = parentPos
+
+			parentPos = Parent(parentPos, f.forestRows)
+			parentH, err = f.readHash(parentPos)
+			if err != nil {
+				return fmt.Errorf("read parent at %d: %w", parentPos, err)
+			}
+		}
+	}
+
+	return nil
+}
+
+// Modify adds and deletes elements from the forest.
+// This implements the Utreexo interface.
+func (f *Forest) Modify(adds []Leaf, delHashes []Hash, _ Proof) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if f.recordMode {
+		return fmt.Errorf("cannot call Modify while in record mode; call HashAll first")
+	}
+
+	return f.modifyInternal(adds, delHashes)
+}
+
+// modifyInternal applies one block, deletions first then additions, and
+// persists the block accounting. The caller holds f.mu and has checked
+// recordMode.
+func (f *Forest) modifyInternal(adds []Leaf, delHashes []Hash) error {
+	// Reject unknown deletions before anything is written: a rejected block
+	// leaves the forest untouched, including its generated-leaves claim.
+	for _, delHash := range delHashes {
+		_, found, err := f.positionMap.Get(delHash)
+		if err != nil {
+			return fmt.Errorf("positionMap.Get: %w", err)
+		}
+		if !found {
+			return fmt.Errorf("delhash %v not found in position map", delHash)
+		}
+	}
+
+	mutating := len(adds) > 0 || len(delHashes) > 0
+
+	// A block is applied by extending the existing parent hashes rather than
+	// rebuilding them, so it is only correct when those hashes are already
+	// current. Reject the block otherwise so stale hashes are never baked into
+	// new parents. The callers' recordMode check does not cover this on its
+	// own, because a Modify or Undo that failed partway leaves the parent
+	// hashes stale while recordMode stays false.
+	if mutating && !f.interiorsCurrent() {
+		return fmt.Errorf("cannot apply a block over stale parent hashes, run HashAll first")
+	}
+
+	// Clear the slot before the first write so an error part way through never
+	// leaves a completeness claim over partially written parent hashes.
+	if mutating {
+		if err := f.clearGeneratedLeaves(); err != nil {
+			return fmt.Errorf("clear generated leaves: %w", err)
+		}
+	}
+
+	// Delete first.
+	for _, delHash := range delHashes {
+		if err := f.deleteSingle(delHash); err != nil {
+			// The parent hash writes may have landed partially, so treat them
+			// as unbuilt and let the next rehash pass run from the first leaf.
+			f.lastGeneratedLeaves = 0
+			return fmt.Errorf("delete: %w", err)
+		}
+	}
+
+	// Then add.
+	for i, leaf := range adds {
+		if err := f.add(leaf.Hash, int32(i)); err != nil {
+			f.lastGeneratedLeaves = 0
+			return fmt.Errorf("add: %w", err)
+		}
+	}
+
+	if err := f.appendBlockCount(uint32(len(adds))); err != nil {
+		return fmt.Errorf("append block count: %w", err)
+	}
+	if err := f.saveNumLeaves(); err != nil {
+		return fmt.Errorf("save num leaves: %w", err)
+	}
+
+	if !mutating {
+		return nil
+	}
+	// The guard above ran with the parent hashes current and the apply
+	// extended them over the new leaves, so they cover every leaf again.
+	f.lastGeneratedLeaves = f.NumLeaves
+	return f.saveGeneratedLeaves()
+}
+
+// ModifyAndReturnTTLs adds and deletes elements from the forest, returning
+// the addIndex for each deleted leaf. This allows computing TTL (time-to-live)
+// for deleted leaves. Returns -1 for leaves added via Ingest or without TTL tracking.
+//
+// This function is safe for concurrent access.
+func (f *Forest) ModifyAndReturnTTLs(adds []Leaf, delHashes []Hash, _ Proof) ([]int32, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if f.recordMode {
+		return nil, fmt.Errorf("cannot call ModifyAndReturnTTLs while in record mode; call HashAll first")
+	}
+
+	// Collect addIndexes before deletion
+	addIndexes := make([]int32, 0, len(delHashes))
+	for _, delHash := range delHashes {
+		packed, found, err := f.positionMap.Get(delHash)
+		if err != nil {
+			return nil, fmt.Errorf("positionMap.Get: %w", err)
+		}
+		if !found {
+			return nil, fmt.Errorf("missing %v in positionMap. Cannot return ttls", delHash)
+		}
+		addIndexes = append(addIndexes, unpackIndex(packed))
+	}
+
+	if err := f.modifyInternal(adds, delHashes); err != nil {
+		return nil, err
+	}
+	return addIndexes, nil
+}
+
+// HashAll computes all parent hashes after Record calls are complete.
+// This builds the complete tree by iterating through all leaves and
+// treating deleted positions as empty (causing siblings to move up).
+func (f *Forest) HashAll() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	// The rebuild below recomputes every interior hash from the first leaf;
+	// until it completes, none of them count as built. An error return part
+	// way through then never leaves a completeness claim over a partially
+	// rebuilt file.
+	if err := f.clearGeneratedLeaves(); err != nil {
+		return fmt.Errorf("clear generated leaves: %w", err)
+	}
+	f.lastGeneratedLeaves = 0
+
+	totalLeaves := f.NumLeaves
+
+	// Reset to rebuild from scratch
+	f.NumLeaves = 0
+
+	if err := f.hashAllLeaves(totalLeaves); err != nil {
+		// The rebuild advances NumLeaves per processed leaf, so a failure
+		// part way through leaves it at a partial count. Restore the real
+		// count: the leaves and block accounting still describe all of
+		// totalLeaves, and a retry or a later Record must start from there
+		// rather than truncate the forest or overwrite live leaves.
+		f.NumLeaves = totalLeaves
+		return err
+	}
+
+	// Every interior hash was just rebuilt from the leaves and the deleted
+	// bitmap, so the next RehashAndProve pass only needs to cover leaves
+	// appended after this point, and every recorded deletion has been
+	// masked by the rebuild.
+	f.lastGeneratedLeaves = totalLeaves
+	f.unmaskedDels = 0
+
+	f.recordMode = false
+	if err := f.saveRecordMode(); err != nil {
+		return fmt.Errorf("save record mode: %w", err)
+	}
+
+	return f.saveGeneratedLeaves()
+}
+
+// hashAllLeaves replays every leaf through the root-merge walk that add uses,
+// writing each parent hash while treating bitmap-deleted leaves as empty.
+// NumLeaves must be zero on entry; it ends at totalLeaves on success and at
+// the number of fully processed leaves on error.
+func (f *Forest) hashAllLeaves(totalLeaves uint64) error {
+	for pos := uint64(0); pos < totalLeaves; pos++ {
+		var hash Hash
+		if f.deletedLeafPositions.isSet(pos) {
+			hash = empty
+		} else {
+			var err error
+			hash, err = f.readHash(pos)
+			if err != nil {
+				return fmt.Errorf("read leaf at %d: %w", pos, err)
+			}
+		}
+
+		// Compute parent hashes (same logic as add but without writing leaf)
+		currentHash := hash
+		currentPos := f.NumLeaves
+
+		for h := uint8(0); (f.NumLeaves>>h)&1 == 1; h++ {
+			rootPos := rootPosition(f.NumLeaves, h, f.forestRows)
+
+			rootHash, err := f.readHash(rootPos)
+			if err != nil {
+				return fmt.Errorf("read root at row %d: %w", h, err)
+			}
+
+			// Check if this root is a deleted leaf - treat as empty if so
+			if f.deletedLeafPositions.isSet(rootPos) {
+				rootHash = empty
+			}
+
+			parentPos := Parent(currentPos, f.forestRows)
+			newHash := parentHash(rootHash, currentHash)
+
+			err = f.writeHash(parentPos, newHash)
+			if err != nil {
+				return fmt.Errorf("write parent at position %d: %w", parentPos, err)
+			}
+
+			currentHash = newHash
+			currentPos = parentPos
+		}
+
+		f.NumLeaves++
+	}
+	return nil
+}
+
+// calculatePosition calculates the logical position of the given hash.
+func (f *Forest) calculatePosition(hash Hash) (uint64, error) {
+	packed, found, err := f.positionMap.Get(hash)
+	if err != nil {
+		return 0, fmt.Errorf("positionMap.Get: %w", err)
+	}
+	if !found {
+		return 0, fmt.Errorf("hash %v not found in the position map", hash)
+	}
+
+	currentPos := unpackPos(packed)
+	currentHash := hash
+	rowsToTop := 0
+	leftRightIndicator := uint64(0)
+	for !isRootPositionTotalRows(currentPos, f.NumLeaves, f.forestRows) {
+		parentPos := Parent(currentPos, f.forestRows)
+		parentH, err := f.readHash(parentPos)
+		if err != nil {
+			return 0, fmt.Errorf("read parent at %d: %w", parentPos, err)
+		}
+
+		if parentH == currentHash {
+			// Sibling was deleted. We don't mark at all because this level doesn't exist.
+		} else {
+			if isLeftNiece(currentPos) {
+				// Left
+				leftRightIndicator <<= 1
+			} else {
+				// Right
+				leftRightIndicator <<= 1
+				leftRightIndicator |= 1
+			}
+			rowsToTop++
+		}
+		currentPos = parentPos
+		currentHash = parentH
+	}
+
+	retPos := currentPos
+	for i := 0; i < rowsToTop; i++ {
+		isRight := uint64(1) << i
+		if leftRightIndicator&isRight == isRight {
+			retPos = RightChild(retPos, f.forestRows)
+		} else {
+			retPos = LeftChild(retPos, f.forestRows)
+		}
+	}
+
+	return retPos, nil
+}
+
+// targetPair holds both calculated position (for ordering) and actual position (for reading).
+type targetPair struct {
+	calcPos   uint64 // Position for sorting and sibling detection (matches pollard)
+	actualPos uint64 // Position in forest file for reading hashes
+}
+
+// fetchProofHashes fetchses the needed hashes to prove the given delHashes.
+func (f *Forest) fetchProofHashes(delHashes []Hash) ([]Hash, error) {
+	if len(delHashes) == 0 {
+		return nil, nil
+	}
+
+	// Build targets with both calculated and actual positions
+	targets := make([]targetPair, 0, len(delHashes))
+	for _, delHash := range delHashes {
+		packed, found, err := f.positionMap.Get(delHash)
+		if err != nil {
+			return nil, fmt.Errorf("positionMap.Get: %w", err)
+		}
+		if !found {
+			return nil, fmt.Errorf("hash %v not found in the position map", delHash)
+		}
+
+		calcPos, err := f.calculatePosition(delHash)
+		if err != nil {
+			return nil, err
+		}
+
+		targets = append(targets, targetPair{calcPos: calcPos, actualPos: unpackPos(packed)})
+	}
+
+	// Sort by calculated position to match pollard ordering
+	slices.SortFunc(targets, func(a, b targetPair) bool {
+		return a.calcPos < b.calcPos
+	})
+
+	// deTwin using calculated positions, accounting for move-ups in actualPos
+	targets, err := f.deTwinPairs(targets)
+	if err != nil {
+		return nil, err
+	}
+
+	proofHashes := make([]Hash, 0, (len(targets) * int(TreeRows(f.NumLeaves)+1)))
+	for row := uint8(0); row <= f.forestRows; row++ {
+		for i := 0; i < len(targets); i++ {
+			calcPos := targets[i].calcPos
+			actualPos := targets[i].actualPos
+
+			if calcPos > maxPossiblePosAtRow(row, f.forestRows) {
+				continue
+			}
+			if row != DetectRow(calcPos, f.forestRows) {
+				continue
+			}
+			if isRootPositionOnRowTotalRows(calcPos, f.NumLeaves, row, f.forestRows) {
+				continue
+			}
+
+			// Walk up actual position to handle move-ups
+			actualParentPos := Parent(actualPos, f.forestRows)
+			parentH, err := f.readHash(actualParentPos)
+			if err != nil {
+				return nil, err
+			}
+			currentHash, err := f.readHash(actualPos)
+			if err != nil {
+				return nil, err
+			}
+			for parentH == currentHash {
+				actualPos = actualParentPos
+				targets[i].actualPos = actualPos
+				actualParentPos = Parent(actualPos, f.forestRows)
+				parentH, err = f.readHash(actualParentPos)
+				if err != nil {
+					return nil, err
+				}
+			}
+
+			// Check if next target is sibling (using calcPos)
+			if i+1 < len(targets) && rightSib(calcPos) == targets[i+1].calcPos {
+				targets[i].calcPos = Parent(calcPos, f.forestRows)
+				targets[i].actualPos = actualParentPos
+				i++ // Skip sibling
+				continue
+			}
+
+			// Read sibling hash from actual sibling position
+			proofHash, err := f.readHash(sibling(actualPos))
+			if err != nil {
+				return nil, err
+			}
+			proofHashes = append(proofHashes, proofHash)
+			targets[i].calcPos = Parent(calcPos, f.forestRows)
+			targets[i].actualPos = actualParentPos
+		}
+
+		slices.SortFunc(targets, func(a, b targetPair) bool {
+			return a.calcPos < b.calcPos
+		})
+	}
+
+	return proofHashes, nil
+}
+
+// deTwinPairs removes sibling pairs from targets using calculated positions.
+// deTwinPairs detwins sibling pairs, updating both calcPos and actualPos.
+// This is a method on Forest because actualPos needs to account for nodes
+// that have moved up due to deletions (parentHash == currentHash).
+func (f *Forest) deTwinPairs(targets []targetPair) ([]targetPair, error) {
+	for i := 0; i < len(targets)-1; i++ {
+		if targets[i].calcPos|1 == targets[i+1].calcPos {
+			targets[i].calcPos = Parent(targets[i].calcPos, f.forestRows)
+
+			// Walk up actualPos to find where the node actually is
+			actualPos := targets[i].actualPos
+			currentHash, err := f.readHash(actualPos)
+			if err != nil {
+				return nil, err
+			}
+			parentPos := Parent(actualPos, f.forestRows)
+			parentHash, err := f.readHash(parentPos)
+			if err != nil {
+				return nil, err
+			}
+			for parentHash == currentHash {
+				actualPos = parentPos
+				parentPos = Parent(actualPos, f.forestRows)
+				parentHash, err = f.readHash(parentPos)
+				if err != nil {
+					return nil, err
+				}
+			}
+			targets[i].actualPos = parentPos
+
+			targets = append(targets[:i+1], targets[i+2:]...)
+			i--
+		}
+	}
+
+	return targets, nil
+}
+
+// Prove generates an inclusion proof for the given hashes.
+// This implements the Utreexo interface by looking up positions from hashes.
+// Uses the walk-up algorithm to find where each hash currently is (it may have
+// moved up due to deletions), then computes the proof positions.
+//
+// This function is safe for concurrent access.
+func (f *Forest) Prove(delHashes []Hash) (Proof, error) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+
+	if len(delHashes) == 0 {
+		return Proof{}, nil
+	}
+
+	// Find target positions using the walk-up algorithm.
+	// calculatePosition returns positions in f.forestRows space.
+	targets := make([]uint64, len(delHashes))
+	for i, hash := range delHashes {
+		target, err := f.calculatePosition(hash)
+		if err != nil {
+			return Proof{}, fmt.Errorf("find target for hash %x: %w", hash[:8], err)
+		}
+		targets[i] = target
+	}
+
+	// Translate from f.forestRows space to defaultForestRows space.
+	if f.forestRows != defaultForestRows {
+		targets = translatePositions(targets, f.forestRows, defaultForestRows)
+	}
+
+	proofHashes, err := f.fetchProofHashes(delHashes)
+	if err != nil {
+		return Proof{}, err
+	}
+
+	return Proof{
+		Targets: targets,
+		Proof:   proofHashes,
+	}, nil
+}
+
+// Verify verifies that the given hashes exist in the forest.
+// This implements the Utreexo interface.
+//
+// This function is safe for concurrent access.
+func (f *Forest) Verify(delHashes []Hash, _ Proof, _ bool) error {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+
+	for _, delHash := range delHashes {
+		packed, found, err := f.positionMap.Get(delHash)
+		if err != nil {
+			return fmt.Errorf("positionMap.Get: %w", err)
+		}
+		if !found {
+			return fmt.Errorf("hash %v doesn't exist in the forest", delHash)
+		}
+
+		if f.deletedLeafPositions.isSet(unpackPos(packed)) {
+			return fmt.Errorf("hash %v has already been deleted in the forest", delHash)
+		}
+	}
+
+	return nil
+}
+
+// GetLeafPosition returns the logical position for the given leaf hash.
+// This implements the Utreexo interface.
+//
+// NOTE: Always returns (0, false) during record mode since hashes have not
+// been computed yet and positions cannot be correctly calculated.
+//
+// This function is safe for concurrent access.
+func (f *Forest) GetLeafPosition(hash Hash) (uint64, bool) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+
+	if f.recordMode {
+		return 0, false
+	}
+
+	pos, err := f.calculatePosition(hash)
+	if err != nil {
+		return 0, false
+	}
+
+	return pos, true
+}
+
+// String returns a string representation of the forest.
+// This implements the Utreexo interface.
+//
+// This function is safe for concurrent access.
+func (f *Forest) String() string {
+	// No explicit lock needed - GetHash/GetRoots/etc. take their own RLocks.
+	// Nested RLocks are allowed by sync.RWMutex.
+	return String(f)
+}
+
+// RawString returns a string representation of the raw file contents.
+// Unlike String() which accounts for move-ups and returns the logical tree structure,
+// RawString() shows the actual bytes stored at each file position. Useful for debugging.
+//
+// This function is safe for concurrent access.
+func (f *Forest) RawString() string {
+	return String(&rawForest{f})
+}
+
+// rawForest wraps Forest to provide raw file reads for GetHash.
+// Unlike Forest.GetHash which traverses from root handling move-ups,
+// rawForest.GetHash reads directly from the file position.
+type rawForest struct {
+	*Forest
+}
+
+func (r *rawForest) GetTreeRows() uint8 { return r.forestRows }
+
+func (r *rawForest) GetHash(position uint64) Hash {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	hash, err := r.readHash(position)
+	if err != nil {
+		return empty
+	}
+	return hash
+}

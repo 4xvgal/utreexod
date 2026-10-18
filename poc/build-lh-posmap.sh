@@ -1,45 +1,34 @@
 #!/usr/bin/env bash
-# PoC: build a lab utreexod that uses the LH (linear hashing) position map.
+# PoC: build a lab utreexod image that uses the LH (linear hashing) position map.
 #
-# Materializes the LH-enabled utreexo library from the bench branch, then
-# cross-compiles the lab fork against it (linux/arm64) and builds the PoC image.
+# The LH-enabled utreexo library is committed in-repo at ./utreexo-lh and wired
+# via `replace github.com/utreexo/utreexo => ./utreexo-lh`, so Dockerfile.lab
+# (COPY . /src) builds it without an absolute host path. This script refreshes
+# that copy from the bench branch and builds the image.
 #
 #   bash poc/build-lh-posmap.sh
-#   colima start --vm-type vz --cpu 4 --memory 6 --disk 40
-#   docker compose -f <coconut_wallet>/docker/regtest/docker-compose.posmap-poc.yml up -d
+#   # then run the mainnet override (reuses the existing datadir volume):
+#   UTREEXOD_LAB_PATH=/Volumes/mx500/utreexo-lab/utreexod docker compose \
+#     -f docker/mainnet-lab/docker-compose.yml \
+#     -f docker/mainnet-lab/docker-compose.lh-posmap.yml up -d --build
 #
-# The position map is selected at runtime by UTREEXOD_POSMAP=lh (default swiss).
+# The map is selected at runtime by UTREEXOD_POSMAP=lh (default: swiss).
 set -euo pipefail
 
-BENCH=${BENCH:-/Volumes/mx500/utreexo-lab/bench-l1}
-LH=${LH:-/Volumes/mx500/utreexo-lab/utreexo-lh}
-POC=${POC:-/Volumes/mx500/utreexo-lab/poc}
 LAB=$(cd "$(dirname "$0")/.." && pwd)
+BENCH=${BENCH:-/Volumes/mx500/utreexo-lab/bench-l1}
+IMAGE=${IMAGE:-cw-utreexod-lh:poc}
 
-echo "==> materialize LH utreexo -> $LH"
-git -C "$BENCH" rev-parse --verify bench/l2-forest >/dev/null
-rm -rf "$LH"; mkdir -p "$LH"
-git -C "$BENCH" archive bench/l2-forest \
-  | tar -x -C "$LH" \
-      --exclude='internal/l2bench' \
-      --exclude='internal/swisstable/bench_l1_test.go' \
-      --exclude='internal/swisstable/bench_l1_alt_test.go'
-# pristine v0.18.0 dependency graph (the LH files add no deps)
-git -C "$BENCH" show v0.18.0:go.mod > "$LH/go.mod"
-git -C "$BENCH" show v0.18.0:go.sum > "$LH/go.sum"
+echo "==> refresh in-repo LH library: $LAB/utreexo-lh"
+rm -rf "$LAB/utreexo-lh"
+mkdir -p "$LAB/utreexo-lh"
+git -C "$BENCH" archive bench/l2-forest | tar -x -C "$LAB/utreexo-lh" \
+  --exclude='internal/l2bench' \
+  --exclude='internal/swisstable/bench_l1_test.go' \
+  --exclude='internal/swisstable/bench_l1_alt_test.go'
+git -C "$BENCH" show v0.18.0:go.mod > "$LAB/utreexo-lh/go.mod"
+git -C "$BENCH" show v0.18.0:go.sum > "$LAB/utreexo-lh/go.sum"
 
-echo "==> cross-compile lab utreexod (linux/arm64) -> $POC/utreexod"
-mkdir -p "$POC"
-cd "$LAB"
-CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o "$POC/utreexod" .
-
-cat > "$POC/Dockerfile" <<'DOCKER'
-FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
-COPY utreexod /usr/local/bin/utreexod
-ENTRYPOINT ["utreexod"]
-DOCKER
-
-echo "==> docker image cw-utreexod-lh:poc"
-docker build -t cw-utreexod-lh:poc "$POC"
-echo "DONE"
+echo "==> docker build -f Dockerfile.lab -t $IMAGE"
+docker build -f "$LAB/Dockerfile.lab" -t "$IMAGE" "$LAB"
+echo "DONE -> $IMAGE"
