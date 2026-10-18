@@ -17,12 +17,15 @@ set -euo pipefail
 
 LAB=$(cd "$(dirname "$0")/.." && pwd)
 BENCH=${BENCH:-/Volumes/mx500/utreexo-lab/bench-l1}
-IMAGE=${IMAGE:-cw-utreexod-lh:poc}
+# Source branch in the utreexo library repo. v2 = poc/lh-keypad (key-prefix,
+# magic LH2, no verifyHash); v1 was bench/l2-forest.
+BRANCH=${BRANCH:-poc/lh-keypad}
+IMAGE=${IMAGE:-cw-utreexod-lh-v2:poc}
 
-echo "==> refresh in-repo LH library: $LAB/utreexo-lh"
+echo "==> refresh in-repo LH library: $LAB/utreexo-lh ($BRANCH)"
 rm -rf "$LAB/utreexo-lh"
 mkdir -p "$LAB/utreexo-lh"
-git -C "$BENCH" archive bench/l2-forest | tar -x -C "$LAB/utreexo-lh" \
+git -C "$BENCH" archive "$BRANCH" | tar -x -C "$LAB/utreexo-lh" \
   --exclude='internal/l2bench' \
   --exclude='internal/swisstable/bench_l1_test.go' \
   --exclude='internal/swisstable/bench_l1_alt_test.go'

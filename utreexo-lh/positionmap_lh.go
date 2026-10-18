@@ -3,6 +3,7 @@
 package utreexo
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"os"
@@ -11,11 +12,18 @@ import (
 	"github.com/utreexo/utreexo/internal/swisstable"
 )
 
-// Linear hashing position map.
+// Linear hashing position map, v2 (key-prefix embedded).
 //
 // The table lives in one mmap'd file: a 64-byte header followed by fixed-size
-// buckets. Entries store only the 7-bit H2 fingerprint plus the packed value;
-// verifyHash reads the key back from the data file, same as the Swiss map.
+// buckets. Each entry stores the packed value plus a 16-byte prefix of the key,
+// so the map confirms a hit by itself and never reads the data file. This
+// removes verifyHash (a random forest_data read per lookup), at the cost of
+// ~36 bytes/entry instead of ~13.
+//
+// The prefix also lets split() re-place entries using the stored key bytes, so
+// the data file is not touched during growth either. A 16-byte prefix is
+// required: 8 bytes would collide ~16 times at 2^34 live entries, 16 bytes
+// gives a 2^-60 table-wide collision probability.
 //
 // Growth is incremental: when the global load exceeds 0.5, one bucket is split
 // into two. There is no O(N) rehash and no presize cliff. Bucket capacity 128
@@ -24,9 +32,11 @@ import (
 // This is a bench/l2-forest addition; it does not replace the production map.
 
 const (
-	lhBucketSlots = 128
-	lhHeaderSize  = 64
-	lhBucketSize  = lhBucketSlots + lhBucketSlots*8
+	lhBucketSlots  = 128
+	lhKeyPrefixLen = 16
+	lhSlotSize     = 8 + lhKeyPrefixLen // packed value + key prefix
+	lhHeaderSize   = 64
+	lhBucketSize   = lhBucketSlots + lhBucketSlots*lhSlotSize
 
 	lhOffMagic = 0
 	lhOffLevel = 8
@@ -35,7 +45,11 @@ const (
 	lhOffHash  = 32
 )
 
-var lhMagic = [8]byte{'L', 'H', '1'}
+// lhMagic is bumped from "LH1" because the on-disk slot layout changed; an
+// existing v1 file fails the magic check and is rebuilt from the data file.
+var lhMagic = [8]byte{'L', 'H', '2'}
+
+var lhZeroPrefix [lhKeyPrefixLen]byte
 
 // swisstable control-byte encoding, mirrored locally (the constants are
 // unexported in the internal package).
@@ -62,11 +76,12 @@ type lhPositionMap struct {
 	splitAt uint64
 	count   uint64
 	buckets uint64 // allocated capacity
-	src     swisstable.HashSource
-	posMask uint64
 }
 
-func newLHPositionMap(ctrlPath string, expectedEntries uint64, consistencyHash [32]byte, dataFile swisstable.HashSource, posMask uint64) (PositionMap, bool, error) {
+// newLHPositionMap keeps the shared factory signature. dataFile and posMask
+// are unused in v2: keys are confirmed by the embedded prefix, so neither the
+// forest data file nor a position mask is needed.
+func newLHPositionMap(ctrlPath string, expectedEntries uint64, consistencyHash [32]byte, _ swisstable.HashSource, _ uint64) (PositionMap, bool, error) {
 	f, err := os.OpenFile(ctrlPath, os.O_RDWR|os.O_CREATE, 0o644)
 	if err != nil {
 		return nil, false, err
@@ -81,7 +96,7 @@ func newLHPositionMap(ctrlPath string, expectedEntries uint64, consistencyHash [
 	if fi.Size() >= lhHeaderSize && consistencyHash != ([32]byte{}) {
 		var hdr [lhHeaderSize]byte
 		if _, err := f.ReadAt(hdr[:], 0); err == nil {
-			if hdr[0] == lhMagic[0] && hdr[1] == lhMagic[1] && hdr[2] == lhMagic[2] {
+			if bytes.Equal(hdr[lhOffMagic:lhOffMagic+8], lhMagic[:]) {
 				var stored [32]byte
 				copy(stored[:], hdr[lhOffHash:lhOffHash+32])
 				reuse = stored == consistencyHash
@@ -89,7 +104,7 @@ func newLHPositionMap(ctrlPath string, expectedEntries uint64, consistencyHash [
 		}
 	}
 
-	m := &lhPositionMap{file: f, src: dataFile, posMask: posMask}
+	m := &lhPositionMap{file: f}
 
 	if reuse {
 		var hdr [lhHeaderSize]byte
@@ -154,17 +169,22 @@ func (m *lhPositionMap) ctrl(b uint64) []byte {
 	return m.mmap[o : o+lhBucketSlots]
 }
 
-func (m *lhPositionMap) slots(b uint64) []byte {
-	o := lhHeaderSize + int(b)*lhBucketSize + lhBucketSlots
-	return m.mmap[o : o+lhBucketSlots*8]
+// slot returns the packed value (first 8 bytes) and the stored key prefix
+// (next 16 bytes) of slot i in bucket b.
+func (m *lhPositionMap) slot(b, i uint64) (uint64, []byte) {
+	o := lhHeaderSize + int(b)*lhBucketSize + lhBucketSlots + int(i)*lhSlotSize
+	return binary.LittleEndian.Uint64(m.mmap[o:]), m.mmap[o+8 : o+8+lhKeyPrefixLen]
 }
 
-func (m *lhPositionMap) getSlot(b, i uint64) uint64 {
-	return binary.LittleEndian.Uint64(m.slots(b)[i*8:])
+func (m *lhPositionMap) setSlot(b, i, packed uint64, prefix []byte) {
+	o := lhHeaderSize + int(b)*lhBucketSize + lhBucketSlots + int(i)*lhSlotSize
+	binary.LittleEndian.PutUint64(m.mmap[o:], packed)
+	copy(m.mmap[o+8:o+8+lhKeyPrefixLen], prefix)
 }
 
-func (m *lhPositionMap) setSlot(b, i, v uint64) {
-	binary.LittleEndian.PutUint64(m.slots(b)[i*8:], v)
+func (m *lhPositionMap) setPacked(b, i, packed uint64) {
+	o := lhHeaderSize + int(b)*lhBucketSize + lhBucketSlots + int(i)*lhSlotSize
+	binary.LittleEndian.PutUint64(m.mmap[o:], packed)
 }
 
 func (m *lhPositionMap) clearBucket(b uint64) {
@@ -172,25 +192,17 @@ func (m *lhPositionMap) clearBucket(b uint64) {
 	for i := range c {
 		c[i] = 0
 	}
-	s := m.slots(b)
+	// Zero the whole slot region (packed + prefix) so stale keys vanish.
+	o := lhHeaderSize + int(b)*lhBucketSize + lhBucketSlots
+	s := m.mmap[o : o+lhBucketSlots*lhSlotSize]
 	for i := range s {
 		s[i] = 0
 	}
 }
 
-func (m *lhPositionMap) verify(packed uint64, expected [32]byte) (bool, error) {
-	pos := packed & m.posMask
-	h, err := m.src.HashAt(int64(pos * 32))
-	if err != nil {
-		return false, err
-	}
-	return h == expected, nil
-}
-
-// Set inserts or updates hash. Growth happens BEFORE the insert (like the
-// Swiss map's pre-insert resize): split() re-reads each displaced key from the
-// data file, and Forest calls positionMap.Set before writeHash, so a key not
-// yet in the table must never be read back mid-split.
+// Set inserts or updates hash. Growth happens BEFORE the insert; split() now
+// re-places entries from their stored prefixes, so the data file is not read
+// and a key need not be resolvable mid-split.
 func (m *lhPositionMap) Set(hash [32]byte, packed uint64) error {
 	if err := m.growFor(1); err != nil {
 		return err
@@ -211,17 +223,14 @@ func (m *lhPositionMap) growFor(add uint64) error {
 // insert places hash without growing.
 func (m *lhPositionMap) insert(hash [32]byte, packed uint64) error {
 	h1, h2 := swissSplitHash(hash)
+	prefix := hash[:lhKeyPrefixLen]
 	for {
 		b := m.bucketFor(h1)
 		ctrl := m.ctrl(b)
 		for i := 0; i < lhBucketSlots; i++ {
 			if ctrl[i] == h2 {
-				ok, err := m.verify(m.getSlot(b, uint64(i)), hash)
-				if err != nil {
-					return err
-				}
-				if ok {
-					m.setSlot(b, uint64(i), packed)
+				if _, p := m.slot(b, uint64(i)); bytes.Equal(p, prefix) {
+					m.setPacked(b, uint64(i), packed)
 					return nil
 				}
 			}
@@ -229,7 +238,7 @@ func (m *lhPositionMap) insert(hash [32]byte, packed uint64) error {
 		for i := 0; i < lhBucketSlots; i++ {
 			if ctrl[i] == ctrlEmptyByte || ctrl[i] == ctrlDeletedByte {
 				ctrl[i] = h2
-				m.setSlot(b, uint64(i), packed)
+				m.setSlot(b, uint64(i), packed, prefix)
 				m.count++
 				return nil
 			}
@@ -241,13 +250,13 @@ func (m *lhPositionMap) insert(hash [32]byte, packed uint64) error {
 	}
 }
 
-func (m *lhPositionMap) place(b uint64, hash [32]byte, packed uint64) error {
-	_, h2 := swissSplitHash(hash)
+// place stores an entry in bucket b without growing or counting; used by split.
+func (m *lhPositionMap) place(b uint64, h2 byte, packed uint64, prefix []byte) error {
 	ctrl := m.ctrl(b)
 	for i := 0; i < lhBucketSlots; i++ {
 		if ctrl[i] == ctrlEmptyByte || ctrl[i] == ctrlDeletedByte {
 			ctrl[i] = h2
-			m.setSlot(b, uint64(i), packed)
+			m.setSlot(b, uint64(i), packed, prefix)
 			return nil
 		}
 	}
@@ -294,21 +303,29 @@ func (m *lhPositionMap) split() error {
 		m.level++
 		m.splitAt = 0
 	}
+
 	ctrl := m.ctrl(oldB)
-	packed := make([]uint64, 0, lhBucketSlots)
+	type entry struct {
+		h1, packed uint64
+		prefix     [lhKeyPrefixLen]byte
+	}
+	ents := make([]entry, 0, lhBucketSlots)
 	for i := 0; i < lhBucketSlots; i++ {
 		if ctrl[i]&ctrlFullByte != 0 {
-			packed = append(packed, m.getSlot(oldB, uint64(i)))
+			p, prefix := m.slot(oldB, uint64(i))
+			var e entry
+			e.packed = p
+			copy(e.prefix[:], prefix)
+			// The prefix's first 8 bytes ARE the key's first 8 bytes (h1),
+			// so the data file is never consulted here.
+			e.h1 = binary.LittleEndian.Uint64(e.prefix[:8])
+			ents = append(ents, e)
 		}
 	}
 	m.clearBucket(oldB)
-	for _, p := range packed {
-		h, err := m.src.HashAt(int64((p & m.posMask) * 32))
-		if err != nil {
-			return err
-		}
-		h1 := binary.LittleEndian.Uint64(h[:8])
-		if err := m.place(m.bucketFor(h1), h, p); err != nil {
+	for _, e := range ents {
+		h2 := (e.prefix[8] & 0x7F) | ctrlFullByte
+		if err := m.place(m.bucketFor(e.h1), h2, e.packed, e.prefix[:]); err != nil {
 			return err
 		}
 	}
@@ -317,16 +334,13 @@ func (m *lhPositionMap) split() error {
 
 func (m *lhPositionMap) Get(hash [32]byte) (uint64, bool, error) {
 	h1, h2 := swissSplitHash(hash)
+	prefix := hash[:lhKeyPrefixLen]
 	b := m.bucketFor(h1)
 	ctrl := m.ctrl(b)
 	for i := 0; i < lhBucketSlots; i++ {
 		if ctrl[i] == h2 {
-			p := m.getSlot(b, uint64(i))
-			ok, err := m.verify(p, hash)
-			if err != nil {
-				return 0, false, err
-			}
-			if ok {
+			p, stored := m.slot(b, uint64(i))
+			if bytes.Equal(stored, prefix) {
 				return p, true, nil
 			}
 		}
@@ -336,17 +350,15 @@ func (m *lhPositionMap) Get(hash [32]byte) (uint64, bool, error) {
 
 func (m *lhPositionMap) Delete(hash [32]byte) (bool, error) {
 	h1, h2 := swissSplitHash(hash)
+	prefix := hash[:lhKeyPrefixLen]
 	b := m.bucketFor(h1)
 	ctrl := m.ctrl(b)
 	for i := 0; i < lhBucketSlots; i++ {
 		if ctrl[i] == h2 {
-			ok, err := m.verify(m.getSlot(b, uint64(i)), hash)
-			if err != nil {
-				return false, err
-			}
-			if ok {
+			_, stored := m.slot(b, uint64(i))
+			if bytes.Equal(stored, prefix) {
 				ctrl[i] = ctrlDeletedByte
-				m.setSlot(b, uint64(i), 0)
+				m.setSlot(b, uint64(i), 0, lhZeroPrefix[:])
 				m.count--
 				return true, nil
 			}
@@ -362,7 +374,8 @@ func (m *lhPositionMap) ForEach(fn func(packed uint64)) {
 		ctrl := m.ctrl(b)
 		for i := 0; i < lhBucketSlots; i++ {
 			if ctrl[i]&ctrlFullByte != 0 {
-				fn(m.getSlot(b, uint64(i)))
+				p, _ := m.slot(b, uint64(i))
+				fn(p)
 			}
 		}
 	}
@@ -383,8 +396,7 @@ func (m *lhPositionMap) SetConsistencyHash(hash [32]byte) error {
 }
 
 func (m *lhPositionMap) BeginBatch(maxEntries uint64) (PositionMapBatch, error) {
-	// Pre-grow so no split (which re-reads the data file) happens during
-	// Record-mode inserts, where the leaf hashes may not be written yet.
+	// Pre-grow once so Record-mode inserts do not split mid-batch.
 	if err := m.growFor(maxEntries); err != nil {
 		return nil, err
 	}
