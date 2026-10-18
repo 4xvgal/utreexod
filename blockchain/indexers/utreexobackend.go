@@ -449,9 +449,23 @@ func InitUtreexoState(cfg *UtreexoConfig, chain *blockchain.BlockChain, ttlIdx *
 	// utreexo point's leaf count to avoid costly resizes during initial
 	// block download.
 	presizeLeaves := uint64(1) << bits.Len64(cfg.Params.AssumeUtreexoPoint.NumLeaves)
+
+	// PoC: position map implementation. "swiss" (default) is the production
+	// Swiss Table; "lh" is the linear-hashing PoC, which grows incrementally
+	// and must not be presized to the assume-utreexo point.
+	posmapKind := os.Getenv("UTREEXOD_POSMAP")
+	if posmapKind == "" {
+		posmapKind = "swiss"
+	}
+	if posmapKind == "lh" {
+		presizeLeaves = 0
+	}
+	log.Infof("Utreexo position map implementation: %s (presizeLeaves=%d)", posmapKind, presizeLeaves)
+
 	forest, err := utreexo.OpenForest(basePath,
 		utreexo.MaxCacheMemory(cfg.MaxMemoryUsage),
 		utreexo.ExpectedMaxLeaves(presizeLeaves),
+		utreexo.PositionMapKind(posmapKind),
 	)
 	if err != nil {
 		return nil, err

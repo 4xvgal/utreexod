@@ -62,3 +62,5 @@ require (
 )
 
 go 1.25
+
+replace github.com/utreexo/utreexo => /Volumes/mx500/utreexo-lab/utreexo-lh
