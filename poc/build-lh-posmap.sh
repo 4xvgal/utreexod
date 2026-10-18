@@ -28,7 +28,10 @@ mkdir -p "$LAB/utreexo-lh"
 git -C "$BENCH" archive "$BRANCH" | tar -x -C "$LAB/utreexo-lh" \
   --exclude='internal/l2bench' \
   --exclude='internal/swisstable/bench_l1_test.go' \
-  --exclude='internal/swisstable/bench_l1_alt_test.go'
+  --exclude='internal/swisstable/bench_l1_alt_test.go' \
+  --exclude='docs' \
+  --exclude='results' \
+  --exclude='scripts'
 git -C "$BENCH" show v0.18.0:go.mod > "$LAB/utreexo-lh/go.mod"
 git -C "$BENCH" show v0.18.0:go.sum > "$LAB/utreexo-lh/go.sum"
 
