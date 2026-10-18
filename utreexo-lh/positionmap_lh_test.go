@@ -24,7 +24,9 @@ func TestLHPositionMapKeyPrefix(t *testing.T) {
 		rng.Read(hashes[i][:])
 	}
 
-	m, rebuild, err := newLHPositionMap(ctrl, n, consistency, nil, 0)
+	// expectedEntries=1 starts the table tiny so the inserts force many splits
+	// (the split path must not need the data file).
+	m, rebuild, err := newLHPositionMap(ctrl, 1, consistency, nil, 0)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -66,7 +68,7 @@ func TestLHPositionMapKeyPrefix(t *testing.T) {
 		}
 	}
 
-	// The magic must be the v2 marker.
+	// The magic must be the v3 marker.
 	var magic [8]byte
 	f, err := os.Open(ctrl)
 	if err != nil {
@@ -76,8 +78,8 @@ func TestLHPositionMapKeyPrefix(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.Close()
-	if string(magic[:3]) != "LH2" {
-		t.Fatalf("magic = %q, want LH2", magic[:3])
+	if string(magic[:3]) != "LH3" {
+		t.Fatalf("magic = %q, want LH3", magic[:3])
 	}
 
 	if err := m.SetConsistencyHash(consistency); err != nil {
