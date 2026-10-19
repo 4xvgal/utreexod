@@ -60,9 +60,30 @@ func (f *Forest) Record(adds []Hash, delHashes []Hash) ([]int32, []uint64, error
 			hashWg.Wait()
 			return nil, nil, fmt.Errorf("positionMap.BeginBatch: %w", err)
 		}
-		for i, hash := range adds {
-			if hash != empty {
-				if err := batch.Insert(hash, packPosIndex(startPos+uint64(i), int32(i))); err != nil {
+		// Insert in bucket order, like processDeletions: the map is a multi-GB
+		// file and the batch writes through pwrite, so consecutive inserts are
+		// grouped onto the same directory index and page instead of scattering
+		// across the block's random hash order. The packed position keeps the
+		// original add index, so the reorder only changes write order.
+		order := make([]int, len(adds))
+		for i := range order {
+			order[i] = i
+		}
+		slices.SortFunc(order, func(a, b int) int {
+			ha := binary.LittleEndian.Uint64(adds[a][:8])
+			hb := binary.LittleEndian.Uint64(adds[b][:8])
+			switch {
+			case ha < hb:
+				return -1
+			case ha > hb:
+				return 1
+			default:
+				return 0
+			}
+		})
+		for _, i := range order {
+			if adds[i] != empty {
+				if err := batch.Insert(adds[i], packPosIndex(startPos+uint64(i), int32(i))); err != nil {
 					hashWg.Wait()
 					return nil, nil, fmt.Errorf("positionMap.Insert: %w", err)
 				}
