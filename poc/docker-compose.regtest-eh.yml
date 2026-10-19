@@ -1,0 +1,71 @@
+# Regtest stack for the EH position map + bucket-order deletion reorder
+# (branch poc/eh-readcoalesce). Self-contained so it does not touch the live
+# mainnet volume or the LH prune stack.
+#
+#   docker compose -f poc/docker-compose.regtest-eh.yml up -d
+#   python3 poc/regtest-v5-mine.py 900
+#   docker logs cw_utreexod_eh_rc
+#   docker compose -f poc/docker-compose.regtest-eh.yml stop utreexod
+#   docker compose -f poc/docker-compose.regtest-eh.yml up -d utreexod   # reopen/reuse check
+services:
+  bitcoind:
+    image: bitcoin/bitcoin:30.2
+    container_name: cw_bitcoind_v5
+    command:
+      - -regtest=1
+      - -server=1
+      - -txindex=1
+      - -rpcuser=coconut
+      - -rpcpassword=coconut
+      - -rpcbind=0.0.0.0
+      - -rpcallowip=0.0.0.0/0
+      - -rpcport=18443
+      - -port=18444
+      - -fallbackfee=0.0001
+      - -datacarrier=1
+      - -datacarriersize=100000
+      - -printtoconsole=1
+    ports:
+      - "18455:18443"
+      - "18456:18444"
+    volumes:
+      - bitcoind_v5_data:/home/bitcoin/.bitcoin
+    healthcheck:
+      test: ["CMD", "bitcoin-cli", "-regtest", "-rpcuser=coconut", "-rpcpassword=coconut", "getblockchaininfo"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  utreexod:
+    image: cw-utreexod-eh-readcoalesce:poc
+    container_name: cw_utreexod_eh_rc
+    network_mode: "service:bitcoind"
+    depends_on:
+      bitcoind:
+        condition: service_healthy
+    environment:
+      UTREEXOD_POSMAP: "eh"
+      UTREEXO_EH_LOAD: "0.80"
+      EH_STATS: "1"
+      UTREEXOD_POSMAP_STATS: "1"
+      UTREEXOD_MAXBLKFILE: "65536"
+    command:
+      - --regtest
+      - --datadir=/data
+      - --rpcuser=coconut
+      - --rpcpass=coconut
+      - --rpclisten=0.0.0.0:18334
+      - --flatutreexoproofindex
+      - --proofonly
+      - --prune=1
+      - --listen=0.0.0.0:18333
+      - --connect=127.0.0.1:18444
+    volumes:
+      - utreexod_eh_rc_data:/data
+    stop_grace_period: 2m
+
+volumes:
+  bitcoind_v5_data:
+    name: cw_bitcoind_v5_data
+  utreexod_eh_rc_data:
+    name: cw_utreexod_eh_rc_data
