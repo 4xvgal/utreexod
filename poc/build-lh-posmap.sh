@@ -17,10 +17,11 @@ set -euo pipefail
 
 LAB=$(cd "$(dirname "$0")/.." && pwd)
 BENCH=${BENCH:-/Volumes/mx500/utreexo-lab/bench-l1}
-# Source branch in the utreexo library repo. v2 = poc/lh-keypad (key-prefix,
-# magic LH2, no verifyHash); v1 was bench/l2-forest.
-BRANCH=${BRANCH:-poc/lh-keypad}
-IMAGE=${IMAGE:-cw-utreexod-lh-v2:poc}
+# Source branch in the utreexo library repo. v4 = poc/lh-liveonly (live-only
+# position map, magic LH4, Proof.DelPacked undo); earlier: v3 poc/lh-keypad-v3,
+# v2 poc/lh-keypad, v1 bench/l2-forest.
+BRANCH=${BRANCH:-poc/lh-liveonly}
+IMAGE=${IMAGE:-cw-utreexod-lh-v4:poc}
 
 echo "==> refresh in-repo LH library: $LAB/utreexo-lh ($BRANCH)"
 rm -rf "$LAB/utreexo-lh"

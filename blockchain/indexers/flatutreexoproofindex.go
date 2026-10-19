@@ -84,11 +84,6 @@ var (
 	// indexer interface which uses this key to determine if the indexer
 	// is resuming or not.
 	flatUtreexoBucketKey = []byte("flatutreexoparentindexkey")
-
-	// emptyUndoBlock is used as a placeholder in the undo files for when the
-	// node is not pruned. We need to place something since the undo files
-	// expect data to be written per block.
-	emptyUndoBlock, _ = serializeUndoBlock(&utreexo.Proof{}, nil)
 )
 
 // Ensure the UtreexoProofIndex type implements the Indexer interface.
@@ -382,49 +377,11 @@ func (idx *FlatUtreexoProofIndex) Init(chain *blockchain.BlockChain,
 		return nil
 	}
 
-	// Make undo blocks for blocks up to 288 block from the tip. 288 since
-	// that's the basis used for NODE_NETWORK_LIMITED. Reorgs that go past
-	// that are gonna be problematic anyways.
-	undoCount := int32(288)
-
-	// The bestHeight is less than 288, then just undo all the blocks we have.
-	if undoCount > bestHeight {
-		undoCount = bestHeight
-	}
-
-	// Disconnect blocks.
-	for i := int32(0); i < undoCount; i++ {
-		height := bestHeight - i
-		err = idx.undoState.DisconnectBlock(height)
-		if err != nil {
-			return err
-		}
-	}
-
-	for height := bestHeight - (undoCount - 1); height <= bestHeight; height++ {
-		ud, err := idx.fetchUtreexoProof(height)
-		if err != nil {
-			return err
-		}
-
-		// Fetch block.
-		block, err := idx.chain.BlockByHeight(height)
-		if err != nil {
-			return err
-		}
-
-		// Generate the data for the undo block.
-		delHashes, err := idx.chain.ReconstructUData(ud, *block.Hash())
-		if err != nil {
-			return err
-		}
-
-		// Store undo block.
-		err = idx.storeUndoBlock(height, &ud.AccProof, delHashes)
-		if err != nil {
-			return err
-		}
-	}
+	// Undo blocks are written at connect time on every node, so there is
+	// nothing to regenerate here. Regenerating from the stored proofs would
+	// drop the packed deletion positions (the proof serialization does not
+	// carry them), breaking Undo. Just remove the proofs; the undo state
+	// already covers the last blocks a reorg can reach.
 
 	// Remove all the proofs as we don't serve proofs as a
 	// pruned bridge node.
@@ -514,20 +471,15 @@ func (idx *FlatUtreexoProofIndex) ConnectBlock(dbTx database.Tx, block *btcutil.
 	for _, ld := range ud.LeafDatas {
 		delHashes = append(delHashes, ld.LeafHash())
 	}
-	// For pruned nodes, we need to save the undo block in order to undo
-	// a block on reorgs. If we have all the proofs block by block, that
-	// data can be used for reorgs but a pruned node will not have the
-	// proofs available.
-	if idx.config.Pruned {
-		err = idx.storeUndoBlock(block.Height(), &ud.AccProof, delHashes)
-		if err != nil {
-			return err
-		}
-	} else {
-		err = idx.undoState.StoreData(block.Height(), emptyUndoBlock)
-		if err != nil {
-			return fmt.Errorf("store undoblock err. %v", err)
-		}
+	// Save the undo block on every node. It carries the proof, the deletion
+	// hashes, and the packed deletion positions (ud.AccProof.DelPacked) that
+	// Undo needs now that the live-only position map drops spent entries. A
+	// pruned node has no stored proof to fall back on; an archive node still
+	// needs the positions, and the stored proof serialization does not keep
+	// them.
+	err = idx.storeUndoBlock(block.Height(), &ud.AccProof, delHashes)
+	if err != nil {
+		return err
 	}
 
 	addHashes := make([]utreexo.Leaf, 0, len(adds))
@@ -536,7 +488,7 @@ func (idx *FlatUtreexoProofIndex) ConnectBlock(dbTx database.Tx, block *btcutil.
 	}
 
 	idx.mtx.Lock()
-	createdIndexes, err := idx.utreexoState.state.ModifyAndReturnTTLs(addHashes, delHashes, ud.AccProof)
+	createdIndexes, _, err := idx.utreexoState.state.ModifyAndReturnTTLs(addHashes, delHashes, ud.AccProof)
 	idx.mtx.Unlock()
 	if err != nil {
 		return err
@@ -859,6 +811,15 @@ func (idx *FlatUtreexoProofIndex) generate(item generateItem) (storeItem, error)
 	if err != nil {
 		return storeItem{}, fmt.Errorf("RehashAndProve at height %d: %w", item.height, err)
 	}
+
+	// Record dropped the spent leaves from the live position map, so pack the
+	// positions it returned with their add indexes for the undo record. Both
+	// slices are in delHashes order.
+	proof.DelPacked = make([]uint64, len(item.pendingDels))
+	for i := range item.pendingDels {
+		proof.DelPacked[i] = utreexo.PackPosIndex(item.pendingDels[i], item.createdIndexes[i])
+	}
+
 	return storeItem{
 		roots:          roots,
 		numLeaves:      numLeaves,
@@ -875,7 +836,13 @@ func (idx *FlatUtreexoProofIndex) generate(item generateItem) (storeItem, error)
 // files for a fully-generated block. Runs in the store goroutine,
 // concurrent with the next block's RehashAndProve (stage 3).
 func (idx *FlatUtreexoProofIndex) store(item storeItem) error {
-	if err := idx.undoState.StoreData(item.height, emptyUndoBlock); err != nil {
+	// Always write a real undo block: a pruned node needs it for reorgs, and
+	// an archive node needs the packed deletion positions it carries.
+	delHashes := make([]utreexo.Hash, len(item.leafDatas))
+	for i := range item.leafDatas {
+		delHashes[i] = item.leafDatas[i].LeafHash()
+	}
+	if err := idx.storeUndoBlock(item.height, &item.proof, delHashes); err != nil {
 		return fmt.Errorf("store undoblock at height %d: %w", item.height, err)
 	}
 	if err := idx.addEmptyTTLs(item.height, int32(item.numAdds)); err != nil {
@@ -1126,6 +1093,16 @@ func (idx *FlatUtreexoProofIndex) getUndoData(block *btcutil.Block) (
 		delHashes, err = idx.chain.ReconstructUData(ud, *block.Hash())
 		if err != nil {
 			return nil, nil, nil, nil, err
+		}
+
+		// The stored proof serialization does not carry the packed deletion
+		// positions; fetch them from the undo block written at connect.
+		undoProof, _, err := idx.fetchUndoBlock(block.Height())
+		if err != nil {
+			return nil, nil, nil, nil, err
+		}
+		if undoProof != nil {
+			proof.DelPacked = undoProof.DelPacked
 		}
 	} else {
 		var err error
@@ -1676,10 +1653,9 @@ func (idx *FlatUtreexoProofIndex) fetchUndoBlock(height int32) (*utreexo.Proof, 
 		return nil, nil, err
 	}
 
-	if bytes.Equal(undoBytes, emptyUndoBlock) {
-		return nil, nil, nil
-	}
-
+	// Even an undo block with no deletions (empty proof, no hashes) is a
+	// valid record: return the decoded empty proof rather than nil so callers
+	// can distinguish "no undo entry" from "nothing was deleted".
 	return deserializeUndoBlock(undoBytes)
 }
 

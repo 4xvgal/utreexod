@@ -130,8 +130,18 @@ func (f *Forest) processDeletions(delHashes []Hash) ([]int32, []uint64, error) {
 		}
 	}
 
-	for _, pos := range delPositions {
+	for i, pos := range delPositions {
 		f.deletedLeafPositions.set(pos)
+		// Drop the spent leaf from the live map. Undo re-inserts it from the
+		// packed values the caller recorded; RehashAndProve consumes the
+		// positions returned here, so no later map lookup is needed.
+		// ponytail: the delete is not journaled, so an unclean crash can leave
+		// the map ahead of the WAL and replay would not find the delhash. A
+		// forced rebuild on next open (or journaling deletes) fixes it; the
+		// lab only restarts gracefully, where Close syncs the map header.
+		if _, err := f.positionMap.Delete(delHashes[i]); err != nil {
+			return nil, nil, fmt.Errorf("positionMap.Delete: %w", err)
+		}
 	}
 	return addIndexes, delPositions, nil
 }

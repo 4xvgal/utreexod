@@ -32,6 +32,14 @@ type Proof struct {
 	// |---\   |---\
 	// 00  01  02  03
 	Proof []Hash
+
+	// DelPacked carries the packed position-map values (see PackPosIndex) of
+	// the leaves being deleted, in the same order as the hashes passed to
+	// Undo. The forest removes a spent leaf from the live position map, so
+	// Undo cannot look the position up again; the caller that applied the
+	// block must persist these values and hand them back through this field.
+	// Proof.Targets is sorted, so it cannot be used to recover the mapping.
+	DelPacked []uint64
 }
 
 // String returns a string of the proof. Useful for debugging.
@@ -1261,7 +1269,7 @@ func AddProof(proofA, proofB Proof, targetHashesA, targetHashesB []Hash, numLeav
 	if totalRows != defaultForestRows {
 		targetsC = translatePositions(targetsC, totalRows, defaultForestRows)
 	}
-	retProof := Proof{targetsC, proofAndPosC.hashes}
+	retProof := Proof{Targets: targetsC, Proof: proofAndPosC.hashes}
 
 	// Get the hashes for the targets.
 	cachedDelHashAndPosA := toHashAndPos(proofA.Targets, targetHashesA)
@@ -1404,7 +1412,7 @@ func (p *Proof) updateProofRemove(blockTargets []uint64, cachedHashes []Hash, up
 		targetsWithHash.positions = translatePositions(targetsWithHash.positions, totalRows, defaultForestRows)
 	}
 
-	*p = Proof{targetsWithHash.positions, newProofs.hashes}
+	*p = Proof{Targets: targetsWithHash.positions, Proof: newProofs.hashes}
 	return targetsWithHash.hashes
 }
 
@@ -1799,7 +1807,7 @@ func GetProofSubset(proof Proof, hashes []Hash, wants []uint64, numLeaves uint64
 		retHashes[i] = targetHashesWithPos.hashes[idx]
 	}
 
-	return retHashes, Proof{wants, posAndHashes.hashes}, nil
+	return retHashes, Proof{Targets: wants, Proof: posAndHashes.hashes}, nil
 }
 
 // maybeRemap remaps the passed in hash and pos if the TreeRows increase after

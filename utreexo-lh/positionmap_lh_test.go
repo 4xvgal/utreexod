@@ -78,8 +78,8 @@ func TestLHPositionMapKeyPrefix(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.Close()
-	if string(magic[:3]) != "LH3" {
-		t.Fatalf("magic = %q, want LH3", magic[:3])
+	if string(magic[:3]) != "LH4" {
+		t.Fatalf("magic = %q, want LH4", magic[:3])
 	}
 
 	if err := m.SetConsistencyHash(consistency); err != nil {

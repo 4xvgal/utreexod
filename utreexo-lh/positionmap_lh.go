@@ -46,10 +46,11 @@ const (
 	lhOffHash  = 32
 )
 
-// lhMagic is bumped from "LH2" because the on-disk slot layout changed (16B to
-// 12B key prefix); an existing v2 file fails the magic check and is rebuilt
-// from the data file.
-var lhMagic = [8]byte{'L', 'H', '3'}
+// lhMagic is bumped to "LH4" for the live-only map: spent leaves are now
+// removed, so a v3 file holds cumulative entries and must be rebuilt once.
+// A previous magic mismatch ("LH2"→"LH3" was a 16B→12B key-prefix layout
+// change) still fails the magic check and rebuilds from the data file.
+var lhMagic = [8]byte{'L', 'H', '4'}
 
 var lhZeroPrefix [lhKeyPrefixLen]byte
 

@@ -396,6 +396,9 @@ func TestRehashDeletionsAndCaptureProof(t *testing.T) {
 
 				proof, err := gotForest.rehashDeletionsAndCaptureProof(delPositions, gotForest.NumLeaves, forestRows)
 				require.NoError(t, err)
+				// This helper captures hashes/targets only; wantForest.Prove also
+				// fills DelPacked, which is not part of what is under test here.
+				wantProof.DelPacked = nil
 				require.Equal(t, wantProof, proof)
 
 				if len(sortedDelHashes) > 0 {
@@ -514,13 +517,14 @@ func TestRehashAndProvePreservesDeletedRootLeaf(t *testing.T) {
 	rootsBefore := f.GetRoots()
 
 	require.NoError(t, f.EnterRecordMode())
-	_, delPositions, err := f.Record(nil, hashes[2:3])
+	addIndexes, delPositions, err := f.Record(nil, hashes[2:3])
 	require.NoError(t, err)
 	_, _, _, err = f.RehashAndProve(delPositions)
 	require.NoError(t, err)
 	require.NoError(t, f.ExitRecordMode())
 
-	require.NoError(t, f.Undo(nil, Proof{}, hashes[2:3], nil))
+	undoProof := Proof{DelPacked: []uint64{packPosIndex(delPositions[0], addIndexes[0])}}
+	require.NoError(t, f.Undo(nil, undoProof, hashes[2:3], nil))
 	require.Equal(t, rootsBefore, f.GetRoots(),
 		"undoing the recorded deletion must restore the root leaf's hash")
 }

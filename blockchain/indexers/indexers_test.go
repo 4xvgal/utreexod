@@ -343,6 +343,16 @@ func testUtreexoProof(block *btcutil.Block, chain *blockchain.BlockChain, indexe
 				return err
 			}
 
+			// The stored proof does not carry the packed deletion positions
+			// Undo now needs; pull them from the undo record.
+			flatUndo, _, err := idxType.fetchUndoBlock(block.Height())
+			if err != nil {
+				return err
+			}
+			if flatUndo != nil {
+				flatUD.AccProof.DelPacked = flatUndo.DelPacked
+			}
+
 		case *UtreexoProofIndex:
 			var err error
 			ud, err = idxType.FetchUtreexoProof(block.Hash())
@@ -358,6 +368,15 @@ func testUtreexoProof(block *btcutil.Block, chain *blockchain.BlockChain, indexe
 				stump, err = dbFetchUtreexoState(dbTx, prevHash)
 				if err != nil {
 					return err
+				}
+
+				// See the flat branch: recover the packed deletion positions.
+				undoProof, _, err := dbFetchUndoData(dbTx, block.Hash())
+				if err != nil {
+					return err
+				}
+				if undoProof != nil {
+					ud.AccProof.DelPacked = undoProof.DelPacked
 				}
 				return nil
 			})

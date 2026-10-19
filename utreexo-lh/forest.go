@@ -110,6 +110,13 @@ func packPosIndex(pos uint64, addIndex int32) uint64 {
 	return (uint64(uint32(addIndex)) << positionBits) | (pos & positionMask)
 }
 
+// PackPosIndex packs a leaf position and its add index into the single value
+// the position map stores. Exported so callers that persist deletion positions
+// for undo can rebuild the exact value Undo re-inserts.
+func PackPosIndex(pos uint64, addIndex int32) uint64 {
+	return packPosIndex(pos, addIndex)
+}
+
 func unpackPos(v uint64) uint64  { return v & positionMask }
 func unpackIndex(v uint64) int32 { return int32(v >> positionBits) }
 
@@ -724,6 +731,13 @@ func (f *Forest) rebuildPositionMap() error {
 				continue
 			}
 
+			// Spent leaves are not live. The map holds hash→position only for
+			// leaves still in the UTXO set, so a rebuild must skip deleted
+			// positions or the map grows back to the cumulative leaf count.
+			if f.deletedLeafPositions.isSet(leafPos) {
+				continue
+			}
+
 			if err := f.positionMap.Set(hash, packPosIndex(leafPos, addIndex)); err != nil {
 				return fmt.Errorf("positionMap.Set at %d: %w", leafPos, err)
 			}
@@ -1037,6 +1051,11 @@ func (f *Forest) deleteSingle(delHash Hash) error {
 				return err
 			}
 		}
+		// The leaf is no longer live, so drop its map entry. Undo re-inserts
+		// it from the packed values stored in the caller's undo record.
+		if _, err := f.positionMap.Delete(delHash); err != nil {
+			return fmt.Errorf("positionMap.Delete: %w", err)
+		}
 		return nil
 	}
 
@@ -1077,6 +1096,13 @@ func (f *Forest) deleteSingle(delHash Hash) error {
 	err = f.rehashToRoot(sibHashPos, sibHash)
 	if err != nil {
 		return err
+	}
+
+	// Tree surgery is done; only now is it safe to drop the map entry. If the
+	// surgery had failed partway, the entry must stay so a retry still finds
+	// the leaf. The spent leaf's hash remains in the data file for Undo.
+	if _, err := f.positionMap.Delete(delHash); err != nil {
+		return fmt.Errorf("positionMap.Delete: %w", err)
 	}
 
 	return nil
@@ -1307,7 +1333,7 @@ func (f *Forest) Undo(prevAdds []Hash, proof Proof, delHashes, prevRoots []Hash)
 		}
 	}
 
-	if err := f.undoInternal(uint64(len(prevAdds)), delHashes); err != nil {
+	if err := f.undoInternal(uint64(len(prevAdds)), delHashes, proof.DelPacked); err != nil {
 		// The parent hash writes may have landed partially, so treat them as
 		// unbuilt and let the next rehash pass run from the first leaf.
 		f.lastGeneratedLeaves = 0
@@ -1325,9 +1351,11 @@ func (f *Forest) Undo(prevAdds []Hash, proof Proof, delHashes, prevRoots []Hash)
 
 // undoInternal reverts additions and deletions.
 // numAdds is how many leaves were added in the block being undone.
-// delHashes are the hashes that were deleted in the block being undone;
-// their positions are looked up from positionMap.
-func (f *Forest) undoInternal(numAdds uint64, delHashes []Hash) error {
+// delHashes are the hashes that were deleted in the block being undone.
+// delPacked carries their packed position-map values (see PackPosIndex) in the
+// same order as delHashes; the live-only position map no longer holds spent
+// entries, so the caller must supply what it recorded when the block applied.
+func (f *Forest) undoInternal(numAdds uint64, delHashes []Hash, delPacked []uint64) error {
 	// Step 1: Undo additions - delete from positionMap before decrementing NumLeaves.
 	for i := range numAdds {
 		pos := f.NumLeaves - numAdds + i
@@ -1353,27 +1381,29 @@ func (f *Forest) undoInternal(numAdds uint64, delHashes []Hash) error {
 		return fmt.Errorf("save num leaves: %w", err)
 	}
 
-	// Step 2: Look up deleted positions from positionMap
-	delPositions := make([]uint64, len(delHashes))
-	for i, hash := range delHashes {
-		packed, found, err := f.positionMap.Get(hash)
-		if err != nil {
-			return fmt.Errorf("positionMap.Get for undo del: %w", err)
-		}
-		if !found {
-			return fmt.Errorf("hash not found in positionMap for undo")
-		}
-		delPositions[i] = unpackPos(packed)
+	// Step 2: The spent leaves were removed from the live position map when
+	// the block was applied, so their positions cannot be looked up now. The
+	// caller hands back the packed values it recorded at apply time. Guard the
+	// lengths so a malformed undo record fails loudly instead of restoring the
+	// wrong leaf.
+	if len(delPacked) != len(delHashes) {
+		return fmt.Errorf("undo: %d delHashes but %d packed positions",
+			len(delHashes), len(delPacked))
 	}
 
-	// Step 3: Undo deletions in reverse order (LIFO)
-	for i := len(delPositions) - 1; i >= 0; i-- {
-		pos := delPositions[i]
+	// Step 3: Undo deletions in reverse order (LIFO), then re-insert each leaf
+	// into the position map with its recorded packed value so a later
+	// re-deletion returns the same position and add index.
+	for i := len(delPacked) - 1; i >= 0; i-- {
+		pos := unpackPos(delPacked[i])
 		f.deletedLeafPositions.unset(pos)
 
 		err := f.undoSingleDeletion(pos)
 		if err != nil {
 			return err
+		}
+		if err := f.positionMap.Set(delHashes[i], delPacked[i]); err != nil {
+			return fmt.Errorf("positionMap.Set for undo del: %w", err)
 		}
 	}
 
@@ -1641,35 +1671,40 @@ func (f *Forest) modifyInternal(adds []Leaf, delHashes []Hash) error {
 }
 
 // ModifyAndReturnTTLs adds and deletes elements from the forest, returning
-// the addIndex for each deleted leaf. This allows computing TTL (time-to-live)
-// for deleted leaves. Returns -1 for leaves added via Ingest or without TTL tracking.
+// the addIndex and leaf position for each deleted leaf. The addIndex lets
+// callers compute TTL (time-to-live); the position lets them persist the
+// packed value Undo needs, since the position map drops spent entries.
+// addIndex is -1 for leaves added via Ingest or without TTL tracking.
 //
 // This function is safe for concurrent access.
-func (f *Forest) ModifyAndReturnTTLs(adds []Leaf, delHashes []Hash, _ Proof) ([]int32, error) {
+func (f *Forest) ModifyAndReturnTTLs(adds []Leaf, delHashes []Hash, _ Proof) ([]int32, []uint64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
 	if f.recordMode {
-		return nil, fmt.Errorf("cannot call ModifyAndReturnTTLs while in record mode; call HashAll first")
+		return nil, nil, fmt.Errorf("cannot call ModifyAndReturnTTLs while in record mode; call HashAll first")
 	}
 
-	// Collect addIndexes before deletion
+	// Collect addIndexes and positions before deletion, while the map still
+	// holds the spent leaves.
 	addIndexes := make([]int32, 0, len(delHashes))
+	delPositions := make([]uint64, 0, len(delHashes))
 	for _, delHash := range delHashes {
 		packed, found, err := f.positionMap.Get(delHash)
 		if err != nil {
-			return nil, fmt.Errorf("positionMap.Get: %w", err)
+			return nil, nil, fmt.Errorf("positionMap.Get: %w", err)
 		}
 		if !found {
-			return nil, fmt.Errorf("missing %v in positionMap. Cannot return ttls", delHash)
+			return nil, nil, fmt.Errorf("missing %v in positionMap. Cannot return ttls", delHash)
 		}
 		addIndexes = append(addIndexes, unpackIndex(packed))
+		delPositions = append(delPositions, unpackPos(packed))
 	}
 
 	if err := f.modifyInternal(adds, delHashes); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return addIndexes, nil
+	return addIndexes, delPositions, nil
 }
 
 // HashAll computes all parent hashes after Record calls are complete.
@@ -1997,9 +2032,25 @@ func (f *Forest) Prove(delHashes []Hash) (Proof, error) {
 		return Proof{}, err
 	}
 
+	// Carry the packed position-map values in input order. The live-only map
+	// drops spent entries when the block is applied, so a caller that later
+	// saves this proof for Undo needs these to re-insert the leaves.
+	delPacked := make([]uint64, len(delHashes))
+	for i, hash := range delHashes {
+		packed, found, err := f.positionMap.Get(hash)
+		if err != nil {
+			return Proof{}, fmt.Errorf("positionMap.Get: %w", err)
+		}
+		if !found {
+			return Proof{}, fmt.Errorf("hash %v not found in the position map", hash)
+		}
+		delPacked[i] = packed
+	}
+
 	return Proof{
-		Targets: targets,
-		Proof:   proofHashes,
+		Targets:   targets,
+		Proof:     proofHashes,
+		DelPacked: delPacked,
 	}, nil
 }
 

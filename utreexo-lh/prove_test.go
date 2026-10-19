@@ -871,7 +871,7 @@ func FuzzGetProofSubset(f *testing.F) {
 		}
 
 		// Store a copy of the cachedProof to later assert that the proof wasn't mutated.
-		cachedProofCopy := Proof{make([]uint64, len(cachedProof.Targets)), make([]Hash, len(cachedProof.Proof))}
+		cachedProofCopy := Proof{Targets: make([]uint64, len(cachedProof.Targets)), Proof: make([]Hash, len(cachedProof.Proof))}
 		copy(cachedProofCopy.Targets, cachedProof.Targets)
 		copy(cachedProofCopy.Proof, cachedProof.Proof)
 
@@ -1106,7 +1106,7 @@ func FuzzUndoProofChain(f *testing.F) {
 				cachedHashesCopy := make([]Hash, len(cachedHashes))
 				copy(cachedHashesCopy, cachedHashes)
 
-				cachedProofCopy := Proof{make([]uint64, len(cachedProof.Targets)), make([]Hash, len(cachedProof.Proof))}
+				cachedProofCopy := Proof{Targets: make([]uint64, len(cachedProof.Targets)), Proof: make([]Hash, len(cachedProof.Proof))}
 				copy(cachedProofCopy.Proof, cachedProof.Proof)
 				copy(cachedProofCopy.Targets, cachedProof.Targets)
 

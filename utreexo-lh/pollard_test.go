@@ -1153,9 +1153,14 @@ func fuzzUndoChain(t *testing.T, p UtreexoTest, blockCount, numAdds, duration ui
 			}
 		}
 
-		undoProof := Proof{Targets: make([]uint64, len(bp.Targets)), Proof: make([]Hash, len(bp.Proof))}
+		undoProof := Proof{
+			Targets:   make([]uint64, len(bp.Targets)),
+			Proof:     make([]Hash, len(bp.Proof)),
+			DelPacked: make([]uint64, len(bp.DelPacked)),
+		}
 		copy(undoProof.Targets, bp.Targets)
 		copy(undoProof.Proof, bp.Proof)
+		copy(undoProof.DelPacked, bp.DelPacked)
 
 		undoDelHashes := make([]Hash, len(delHashes))
 		copy(undoDelHashes, delHashes)
@@ -1211,9 +1216,14 @@ func fuzzUndoChain(t *testing.T, p UtreexoTest, blockCount, numAdds, duration ui
 		// Undo the last 10 modifies and re-do them.
 		if b%10 == 9 {
 			for i := 9; i >= 0; i-- {
-				copyProof := Proof{Targets: make([]uint64, len(undoData[i].proof.Targets)), Proof: make([]Hash, len(undoData[i].proof.Proof))}
+				copyProof := Proof{
+					Targets:   make([]uint64, len(undoData[i].proof.Targets)),
+					Proof:     make([]Hash, len(undoData[i].proof.Proof)),
+					DelPacked: make([]uint64, len(undoData[i].proof.DelPacked)),
+				}
 				copy(copyProof.Targets, undoData[i].proof.Targets)
 				copy(copyProof.Proof, undoData[i].proof.Proof)
+				copy(copyProof.DelPacked, undoData[i].proof.DelPacked)
 
 				addHashes := make([]Hash, len(undoData[i].adds))
 				for j, add := range undoData[i].adds {

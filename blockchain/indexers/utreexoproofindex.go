@@ -342,12 +342,11 @@ func (idx *UtreexoProofIndex) Create(dbTx database.Tx) error {
 		return err
 	}
 
-	// Only create the undo bucket if the node is pruned.
-	if idx.config.Pruned {
-		_, err = utreexoParentBucket.CreateBucket(utreexoUndoKey)
-		if err != nil {
-			return err
-		}
+	// Create the undo bucket on every node: the packed deletion positions
+	// Undo needs are stored here even for archive nodes.
+	_, err = utreexoParentBucket.CreateBucket(utreexoUndoKey)
+	if err != nil {
+		return err
 	}
 
 	return nil
@@ -388,13 +387,13 @@ func (idx *UtreexoProofIndex) ConnectBlock(dbTx database.Tx, block *btcutil.Bloc
 		delHashes[i] = ud.LeafDatas[i].LeafHash()
 	}
 
-	// For pruned nodes, the undo data is necessary for reorgs.
-	if idx.config.Pruned {
-		err = dbStoreUndoData(dbTx,
-			&ud.AccProof, block.Hash(), delHashes)
-		if err != nil {
-			return err
-		}
+	// Store the undo data on every node. It carries the packed deletion
+	// positions (ud.AccProof.DelPacked) that Undo needs now that the live-only
+	// position map drops spent entries; the stored proof serialization does
+	// not keep them.
+	err = dbStoreUndoData(dbTx, &ud.AccProof, block.Hash(), delHashes)
+	if err != nil {
+		return err
 	}
 
 	addHashes := make([]utreexo.Leaf, 0, len(adds))
@@ -453,6 +452,16 @@ func (idx *UtreexoProofIndex) getUndoData(dbTx database.Tx, block *btcutil.Block
 		delHashes, err = idx.chain.ReconstructUData(ud, *block.Hash())
 		if err != nil {
 			return nil, nil, nil, err
+		}
+
+		// The stored proof serialization does not carry the packed deletion
+		// positions; fetch them from the undo entry written at connect.
+		undoProof, _, err := dbFetchUndoData(dbTx, block.Hash())
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		if undoProof != nil {
+			proof.DelPacked = undoProof.DelPacked
 		}
 	} else {
 		var err error

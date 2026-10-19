@@ -7,6 +7,7 @@ package indexers
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"math/bits"
 	"os"
 	"path/filepath"
@@ -262,19 +263,35 @@ func (idx *FlatUtreexoProofIndex) CloseUtreexoState() error {
 	return idx.utreexoState.state.Close(bestHash)
 }
 
+// undoBlockV2Magic marks an undo record that carries the packed deletion
+// positions (Proof.DelPacked) the live-only position map requires for Undo.
+// v1 records have no marker and no packed positions; they stay readable for
+// the record types that never needed them.
+var undoBlockV2Magic = [4]byte{0x55, 0x54, 0x52, 0x34} // "UTR4"
+
 // serializeUndoBlock serializes all the data that's needed for undoing a full utreexo state
 // into a slice of bytes.
 func serializeUndoBlock(proof *utreexo.Proof, delHashes []utreexo.Hash) ([]byte, error) {
+	delPacked := proof.DelPacked
 	proofSize := wire.BatchProofSerializeSize(proof)
 	delHashesCountSize := 4
 	delHashesSize := len(delHashes) * chainhash.HashSize
+	delPackedCountSize := 4
+	delPackedSize := len(delPacked) * 8
 
-	w := bytes.NewBuffer(make([]byte, 0, proofSize+delHashesCountSize+delHashesSize))
+	w := bytes.NewBuffer(make([]byte, 0, len(undoBlockV2Magic)+proofSize+
+		delHashesCountSize+delHashesSize+delPackedCountSize+delPackedSize))
+
+	// Version marker.
+	_, err := w.Write(undoBlockV2Magic[:])
+	if err != nil {
+		return nil, err
+	}
 
 	// Write the proof.
 	//
 	// Proofs are prefixed with the count in uint32.
-	err := wire.BatchProofSerialize(w, proof)
+	err = wire.BatchProofSerialize(w, proof)
 	if err != nil {
 		return nil, err
 	}
@@ -295,13 +312,51 @@ func serializeUndoBlock(proof *utreexo.Proof, delHashes []utreexo.Hash) ([]byte,
 		}
 	}
 
+	// Write the packed deletion positions in the same order as delHashes.
+	byteOrder.PutUint32(buf[:], uint32(len(delPacked)))
+	_, err = w.Write(buf[:])
+	if err != nil {
+		return nil, err
+	}
+	for _, packed := range delPacked {
+		var pbuf [8]byte
+		byteOrder.PutUint64(pbuf[:], packed)
+		_, err = w.Write(pbuf[:])
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	return w.Bytes(), nil
 }
 
 // deserializeUndoBlock deserializes all the data that's needed to undo a full utreexo
 // state from a slice of serialized bytes.
 func deserializeUndoBlock(serialized []byte) (*utreexo.Proof, []utreexo.Hash, error) {
+	// No undo entry (for example an archive node that never stored one).
+	if len(serialized) == 0 {
+		return nil, nil, nil
+	}
+
 	r := bytes.NewReader(serialized)
+
+	// A v2 record starts with the marker; a v1 record starts with the proof's
+	// target count. Snap the marker off and note the version so the packed
+	// section is only read when present.
+	v2 := false
+	if len(serialized) >= len(undoBlockV2Magic) {
+		var magic [4]byte
+		if _, err := io.ReadFull(r, magic[:]); err != nil {
+			return nil, nil, err
+		}
+		if magic == undoBlockV2Magic {
+			v2 = true
+		} else {
+			if _, err := r.Seek(0, io.SeekStart); err != nil {
+				return nil, nil, err
+			}
+		}
+	}
 
 	proof, err := wire.BatchProofDeserialize(r)
 	if err != nil {
@@ -310,21 +365,34 @@ func deserializeUndoBlock(serialized []byte) (*utreexo.Proof, []utreexo.Hash, er
 
 	// Read the delHashes.
 	var buf [4]byte
-	_, err = r.Read(buf[:])
-	if err != nil {
+	if _, err := io.ReadFull(r, buf[:]); err != nil {
 		return nil, nil, err
 	}
 	hashLen := byteOrder.Uint32(buf[:])
 	delHashes := make([]utreexo.Hash, hashLen)
 
-	var hashBuf utreexo.Hash
 	for i := range delHashes {
-		_, err = r.Read(hashBuf[:])
-		if err != nil {
+		if _, err := io.ReadFull(r, delHashes[i][:]); err != nil {
 			return nil, nil, err
 		}
+	}
 
-		delHashes[i] = *(*utreexo.Hash)(hashBuf[:])
+	if !v2 {
+		return proof, delHashes, nil
+	}
+
+	// Read the packed deletion positions.
+	if _, err := io.ReadFull(r, buf[:]); err != nil {
+		return nil, nil, err
+	}
+	packedLen := byteOrder.Uint32(buf[:])
+	proof.DelPacked = make([]uint64, packedLen)
+	var pbuf [8]byte
+	for i := range proof.DelPacked {
+		if _, err := io.ReadFull(r, pbuf[:]); err != nil {
+			return nil, nil, err
+		}
+		proof.DelPacked[i] = byteOrder.Uint64(pbuf[:])
 	}
 
 	return proof, delHashes, nil
@@ -413,7 +481,7 @@ func (us *UtreexoState) initConsistentUtreexoState(chain *blockchain.BlockChain,
 				return err
 			}
 		} else {
-			createIndexes, err := us.state.ModifyAndReturnTTLs(addHashes, delHashes, ud.AccProof)
+			createIndexes, _, err := us.state.ModifyAndReturnTTLs(addHashes, delHashes, ud.AccProof)
 			if err != nil {
 				return err
 			}

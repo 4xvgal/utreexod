@@ -1088,7 +1088,7 @@ func FuzzMapPollardTTLs(f *testing.F) {
 			}
 
 			// Forest should return the same addIndexes
-			forestIndex, err := forest.ModifyAndReturnTTLs(adds, delHashes, proof)
+			forestIndex, forestDels, err := forest.ModifyAndReturnTTLs(adds, delHashes, proof)
 			if err != nil {
 				t.Fatalf("FuzzMapPollardTTLs fail at block %d. Forest error: %v", b, err)
 			}
@@ -1117,7 +1117,14 @@ func FuzzMapPollardTTLs(f *testing.F) {
 				t.Fatalf("FuzzMapPollardTTLs fail at block %d. Error: %v", b, err)
 			}
 
-			err = forest.Undo(addHashes, proof, delHashes, origRoots)
+			// The live-only forest dropped the spent entries, so Undo needs the
+			// packed positions the first ModifyAndReturnTTLs recorded.
+			undoProof := proof
+			undoProof.DelPacked = make([]uint64, len(forestDels))
+			for i := range forestDels {
+				undoProof.DelPacked[i] = packPosIndex(forestDels[i], forestIndex[i])
+			}
+			err = forest.Undo(addHashes, undoProof, delHashes, origRoots)
 			if err != nil {
 				t.Fatalf("FuzzMapPollardTTLs fail at block %d. Forest error: %v", b, err)
 			}
@@ -1129,7 +1136,7 @@ func FuzzMapPollardTTLs(f *testing.F) {
 
 			require.Equal(t, createIndex, gotIndex)
 
-			gotForestIndex, err := forest.ModifyAndReturnTTLs(adds, delHashes, proof)
+			gotForestIndex, _, err := forest.ModifyAndReturnTTLs(adds, delHashes, proof)
 			if err != nil {
 				t.Fatalf("FuzzMapPollardTTLs fail at block %d. Forest error: %v", b, err)
 			}

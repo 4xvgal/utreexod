@@ -1812,7 +1812,7 @@ func (m *MapPollard) MakeProofFull(origTargets []uint64, haves []bool, proofHash
 		}
 	}
 
-	return &Proof{origTargets, allProofHashes}, nil
+	return &Proof{Targets: origTargets, Proof: allProofHashes}, nil
 }
 
 // VerifyPartialProof takes partial proof of the targets and attempts to prove their existence.
@@ -1855,7 +1855,7 @@ func (m *MapPollard) VerifyPartialProof(origTargets []uint64, delHashes, proofHa
 	}
 
 	// Verify the proof we put together.
-	return m.verify(delHashes, Proof{origTargets, allProofHashes}, remember)
+	return m.verify(delHashes, Proof{Targets: origTargets, Proof: allProofHashes}, remember)
 }
 
 // GetMissingPositions returns all the missing positions that are needed to verify the given

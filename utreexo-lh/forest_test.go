@@ -299,19 +299,18 @@ func TestForestSanityCheck(t *testing.T) {
 // sanityCheck checks for inconsistencies in the forest.
 // This implements the UtreexoTest interface.
 func (f *Forest) sanityCheck() error {
-	// Check 0: Verify positionMap entry count matches expected
-	// positionMap should have exactly NumLeaves
-	expectedPosMapCount := f.NumLeaves
+	// Check 0: the live-only positionMap holds exactly the non-deleted leaves.
+	deletedCount := uint64(f.deletedLeafPositions.count())
+	expectedPosMapCount := f.NumLeaves - deletedCount
 	actualPosMapCount := f.positionMap.Count()
 	if actualPosMapCount != expectedPosMapCount {
-		return fmt.Errorf("positionMap count mismatch: expected %d, got %d",
-			expectedPosMapCount, actualPosMapCount)
+		return fmt.Errorf("positionMap count mismatch: expected %d live (NumLeaves %d - %d deleted), got %d",
+			expectedPosMapCount, f.NumLeaves, deletedCount, actualPosMapCount)
 	}
 
 	// Check 0.5: Verify deletedLeafPositions bitmap is consistent with positionMap.
-	// Every position marked deleted must be a valid leaf in positionMap, and the
-	// number of deleted + live leaves must equal NumLeaves.
-	deletedCount := uint64(f.deletedLeafPositions.count())
+	// Every live position must be in positionMap, and the number of deleted +
+	// live leaves must equal NumLeaves.
 	liveCount := uint64(0)
 	f.positionMap.ForEach(func(packed uint64) {
 		pos := unpackPos(packed)
@@ -636,7 +635,7 @@ func TestMutationsBlockedInRecordMode(t *testing.T) {
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "record mode")
 
-	_, err = forest.ModifyAndReturnTTLs(nil, nil, Proof{})
+	_, _, err = forest.ModifyAndReturnTTLs(nil, nil, Proof{})
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "record mode")
 
@@ -1067,10 +1066,12 @@ func TestForestVerifyDeletedLeaf(t *testing.T) {
 	err = forest.Modify(nil, []Hash{delHash}, Proof{})
 	require.NoError(t, err)
 
-	// Verify the deleted leaf should now fail
+	// Verify the deleted leaf should now fail. The live-only map drops the
+	// entry on deletion, so the error is "doesn't exist" rather than "already
+	// been deleted"; either way the spend is rejected.
 	err = forest.Verify([]Hash{delHash}, Proof{}, false)
 	require.Error(t, err, "Verify should reject deleted leaf")
-	require.Contains(t, err.Error(), "already been deleted")
+	require.Contains(t, err.Error(), "doesn't exist")
 
 	// Other leaves should still verify
 	for i, h := range hashes {
@@ -1103,13 +1104,18 @@ func TestForestRebuildPositionMap(t *testing.T) {
 		hash   Hash
 		packed uint64
 	}
+	// Live leaves only: the live-only map has already dropped the spent ones,
+	// and rebuild must not re-insert them.
 	allLeaves := make([]leafEntry, 0, forest.NumLeaves)
 	for pos := uint64(0); pos < forest.NumLeaves; pos++ {
+		if forest.deletedLeafPositions.isSet(pos) {
+			continue
+		}
 		hash, err := forest.readHash(pos)
 		require.NoError(t, err)
 		packed, found, err := forest.positionMap.Get(hash)
 		require.NoError(t, err)
-		require.True(t, found, "leaf at pos %d not found before rebuild", pos)
+		require.True(t, found, "live leaf at pos %d not found before rebuild", pos)
 		allLeaves = append(allLeaves, leafEntry{hash: hash, packed: packed})
 	}
 
@@ -1245,7 +1251,9 @@ func TestForestUndoAfterRebuild(t *testing.T) {
 	proof, err := pollard.Prove(delHashes)
 	require.NoError(t, err)
 
-	err = forest.Modify(adds, delHashes, Proof{})
+	// Use ModifyAndReturnTTLs so we capture the packed positions the live-only
+	// map drops and Undo must be handed back after the rebuild.
+	lastAddIndexes, lastDelPositions, err := forest.ModifyAndReturnTTLs(adds, delHashes, Proof{})
 	require.NoError(t, err)
 
 	err = pollard.Modify(adds, delHashes, proof)
@@ -1283,7 +1291,11 @@ func TestForestUndoAfterRebuild(t *testing.T) {
 		"roots should match after restart with rebuilt positionMap")
 
 	// Undo the last block on the restarted forest.
-	err = forest2.Undo(prevAdds, Proof{}, delHashes, checkpointRoots)
+	undoProof := Proof{DelPacked: make([]uint64, len(lastDelPositions))}
+	for i := range lastDelPositions {
+		undoProof.DelPacked[i] = packPosIndex(lastDelPositions[i], lastAddIndexes[i])
+	}
+	err = forest2.Undo(prevAdds, undoProof, delHashes, checkpointRoots)
 	require.NoError(t, err)
 
 	// After undo, roots should match the checkpoint.
