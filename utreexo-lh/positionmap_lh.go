@@ -36,8 +36,13 @@ const (
 	lhBucketSlots  = 128
 	lhKeyPrefixLen = 12
 	lhSlotSize     = 8 + lhKeyPrefixLen // packed value + key prefix
-	lhHeaderSize   = 64
-	lhBucketSize   = lhBucketSlots + lhBucketSlots*lhSlotSize
+	// Buckets are one page each: the header occupies the first page and every
+	// bucket starts on a page boundary, so a random insert dirties exactly one
+	// 4 KiB page instead of straddling two (the map is the dominant random-write
+	// source, so this cuts its write I/Os by ~40%). The used part of a bucket is
+	// lhBucketSlots + lhBucketSlots*lhSlotSize = 2688 bytes; the rest is slack.
+	lhHeaderSize = 4096
+	lhBucketSize = 4096
 
 	lhOffMagic = 0
 	lhOffLevel = 8
@@ -46,11 +51,9 @@ const (
 	lhOffHash  = 32
 )
 
-// lhMagic is bumped to "LH4" for the live-only map: spent leaves are now
-// removed, so a v3 file holds cumulative entries and must be rebuilt once.
-// A previous magic mismatch ("LH2"→"LH3" was a 16B→12B key-prefix layout
-// change) still fails the magic check and rebuilds from the data file.
-var lhMagic = [8]byte{'L', 'H', '4'}
+// lhMagic is bumped to "LH5" for the one-page-bucket layout. Earlier magics
+// ("LH4" live-only, "LH3" 12B key prefix) fail the check and rebuild once.
+var lhMagic = [8]byte{'L', 'H', '5'}
 
 var lhZeroPrefix [lhKeyPrefixLen]byte
 
@@ -159,7 +162,7 @@ func newLHPositionMap(ctrlPath string, expectedEntries uint64, consistencyHash [
 	}
 
 	size := int64(lhHeaderSize + m.buckets*lhBucketSize)
-	mm, err := syscall.Mmap(int(f.Fd()), 0, int(size), syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED)
+	mm, err := syscall.Mmap(int(f.Fd()), 0, int(size), syscall.PROT_READ, syscall.MAP_SHARED)
 	if err != nil {
 		f.Close()
 		return nil, false, err
@@ -195,28 +198,44 @@ func (m *lhPositionMap) slot(b, i uint64) (uint64, []byte) {
 	return binary.LittleEndian.Uint64(m.mmap[o:]), m.mmap[o+8 : o+8+lhKeyPrefixLen]
 }
 
-func (m *lhPositionMap) setSlot(b, i, packed uint64, prefix []byte) {
-	o := lhHeaderSize + int(b)*lhBucketSize + lhBucketSlots + int(i)*lhSlotSize
-	binary.LittleEndian.PutUint64(m.mmap[o:], packed)
-	copy(m.mmap[o+8:o+8+lhKeyPrefixLen], prefix)
+// bucketStart is the byte offset of bucket b's control bytes.
+func (m *lhPositionMap) bucketStart(b uint64) int64 {
+	return int64(lhHeaderSize + int(b)*lhBucketSize)
 }
 
-func (m *lhPositionMap) setPacked(b, i, packed uint64) {
-	o := lhHeaderSize + int(b)*lhBucketSize + lhBucketSlots + int(i)*lhSlotSize
-	binary.LittleEndian.PutUint64(m.mmap[o:], packed)
+// writeAt writes directly to the file. Position-map mutations go through
+// pwrite instead of stores into the shared mmap: on btrfs the dirty-page
+// writeback path turns each ~4 KiB random mmap write into tens of times the
+// device writes (prof/mmaptest7), while the buffered write path does not
+// (prof/mmaptest9). Reads keep using the read-only mmap.
+func (m *lhPositionMap) writeAt(off int64, p []byte) error {
+	_, err := m.file.WriteAt(p, off)
+	return err
 }
 
-func (m *lhPositionMap) clearBucket(b uint64) {
-	c := m.ctrl(b)
-	for i := range c {
-		c[i] = 0
-	}
-	// Zero the whole slot region (packed + prefix) so stale keys vanish.
-	o := lhHeaderSize + int(b)*lhBucketSize + lhBucketSlots
-	s := m.mmap[o : o+lhBucketSlots*lhSlotSize]
-	for i := range s {
-		s[i] = 0
-	}
+// setCtrl stores control byte i of bucket b.
+func (m *lhPositionMap) setCtrl(b, i uint64, v byte) error {
+	return m.writeAt(m.bucketStart(b)+int64(i), []byte{v})
+}
+
+func (m *lhPositionMap) setSlot(b, i, packed uint64, prefix []byte) error {
+	var buf [lhSlotSize]byte
+	binary.LittleEndian.PutUint64(buf[:], packed)
+	copy(buf[8:8+lhKeyPrefixLen], prefix)
+	return m.writeAt(m.bucketStart(b)+int64(lhBucketSlots+i*lhSlotSize), buf[:])
+}
+
+func (m *lhPositionMap) setPacked(b, i, packed uint64) error {
+	var buf [8]byte
+	binary.LittleEndian.PutUint64(buf[:], packed)
+	return m.writeAt(m.bucketStart(b)+int64(lhBucketSlots+i*lhSlotSize), buf[:])
+}
+
+// clearBucket zeroes the control bytes and every slot of bucket b, so stale
+// keys vanish.
+func (m *lhPositionMap) clearBucket(b uint64) error {
+	var zero [lhBucketSize]byte
+	return m.writeAt(m.bucketStart(b), zero[:])
 }
 
 // Set inserts or updates hash. Growth happens BEFORE the insert; split() now
@@ -251,8 +270,7 @@ func (m *lhPositionMap) insert(hash [32]byte, packed uint64) error {
 		for i := 0; i < lhBucketSlots; i++ {
 			if ctrl[i] == h2 {
 				if _, p := m.slot(b, uint64(i)); bytes.Equal(p, prefix) {
-					m.setPacked(b, uint64(i), packed)
-					return nil
+					return m.setPacked(b, uint64(i), packed)
 				}
 			}
 		}
@@ -261,8 +279,12 @@ func (m *lhPositionMap) insert(hash [32]byte, packed uint64) error {
 				if ctrl[i] == ctrlDeletedByte {
 					m.tombSlots--
 				}
-				ctrl[i] = h2
-				m.setSlot(b, uint64(i), packed, prefix)
+				if err := m.setCtrl(b, uint64(i), h2); err != nil {
+					return err
+				}
+				if err := m.setSlot(b, uint64(i), packed, prefix); err != nil {
+					return err
+				}
 				m.count++
 				return nil
 			}
@@ -280,9 +302,10 @@ func (m *lhPositionMap) place(b uint64, h2 byte, packed uint64, prefix []byte) e
 	ctrl := m.ctrl(b)
 	for i := 0; i < lhBucketSlots; i++ {
 		if ctrl[i] == ctrlEmptyByte || ctrl[i] == ctrlDeletedByte {
-			ctrl[i] = h2
-			m.setSlot(b, uint64(i), packed, prefix)
-			return nil
+			if err := m.setCtrl(b, uint64(i), h2); err != nil {
+				return err
+			}
+			return m.setSlot(b, uint64(i), packed, prefix)
 		}
 	}
 	m.placeFull++
@@ -308,7 +331,7 @@ func (m *lhPositionMap) ensureBuckets(idx uint64) error {
 		return err
 	}
 	mm, err := syscall.Mmap(int(m.file.Fd()), 0, int(newSize),
-		syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED)
+		syscall.PROT_READ, syscall.MAP_SHARED)
 	if err != nil {
 		return err
 	}
@@ -323,7 +346,9 @@ func (m *lhPositionMap) split() error {
 	if err := m.ensureBuckets(newB); err != nil {
 		return err
 	}
-	m.clearBucket(newB)
+	if err := m.clearBucket(newB); err != nil {
+		return err
+	}
 	m.splitAt++
 	if m.splitAt == (uint64(1) << m.level) {
 		m.level++
@@ -356,7 +381,9 @@ func (m *lhPositionMap) split() error {
 	} else {
 		m.tombSlots -= tomb
 	}
-	m.clearBucket(oldB)
+	if err := m.clearBucket(oldB); err != nil {
+		return err
+	}
 	for _, e := range ents {
 		h2 := (e.prefix[8] & 0x7F) | ctrlFullByte
 		if err := m.place(m.bucketFor(e.h1), h2, e.packed, e.prefix[:]); err != nil {
@@ -392,8 +419,12 @@ func (m *lhPositionMap) Delete(hash [32]byte) (bool, error) {
 		if ctrl[i] == h2 {
 			_, stored := m.slot(b, uint64(i))
 			if bytes.Equal(stored, prefix) {
-				ctrl[i] = ctrlDeletedByte
-				m.setSlot(b, uint64(i), 0, lhZeroPrefix[:])
+				if err := m.setCtrl(b, uint64(i), ctrlDeletedByte); err != nil {
+					return false, err
+				}
+				if err := m.setSlot(b, uint64(i), 0, lhZeroPrefix[:]); err != nil {
+					return false, err
+				}
 				m.count--
 				m.tombSlots++
 				return true, nil
@@ -446,14 +477,18 @@ func (m *lhPositionMap) ForEach(fn func(packed uint64)) {
 	}
 }
 
-func (m *lhPositionMap) syncHeader() {
-	binary.LittleEndian.PutUint64(m.mmap[lhOffLevel:], m.level)
-	binary.LittleEndian.PutUint64(m.mmap[lhOffSplit:], m.splitAt)
-	binary.LittleEndian.PutUint64(m.mmap[lhOffCount:], m.count)
+func (m *lhPositionMap) syncHeader() error {
+	var buf [24]byte
+	binary.LittleEndian.PutUint64(buf[0:], m.level)
+	binary.LittleEndian.PutUint64(buf[8:], m.splitAt)
+	binary.LittleEndian.PutUint64(buf[16:], m.count)
+	return m.writeAt(lhOffLevel, buf[:])
 }
 
 func (m *lhPositionMap) SetConsistencyHash(hash [32]byte) error {
-	m.syncHeader()
+	if err := m.syncHeader(); err != nil {
+		return err
+	}
 	if _, err := m.file.WriteAt(hash[:], lhOffHash); err != nil {
 		return err
 	}
@@ -473,13 +508,16 @@ type lhBatch struct{ m *lhPositionMap }
 func (b *lhBatch) Insert(h [32]byte, p uint64) error { return b.m.insert(h, p) }
 
 func (m *lhPositionMap) Close() error {
-	m.syncHeader()
+	werr := m.syncHeader()
 	if m.statsOn {
 		m.logStats("close")
 	}
 	err := syscall.Munmap(m.mmap)
 	if e := m.file.Close(); err == nil {
 		err = e
+	}
+	if werr != nil && err == nil {
+		err = werr
 	}
 	return err
 }

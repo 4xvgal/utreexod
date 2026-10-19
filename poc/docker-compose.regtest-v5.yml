@@ -1,0 +1,71 @@
+# Prune regression stack for the uint32-overflow fix (branch poc/lh-posmap-v5).
+#
+# Small flat files + a 1 MiB prune target make pruning occur after a few
+# hundred regtest blocks carrying a ~2 KB OP_RETURN each, so the >4 GiB
+# accumulation path can be exercised end to end without mining gigabytes.
+#
+#   docker compose -f poc/docker-compose.regtest-v5.yml up -d
+#   python3 poc/regtest-v5-mine.py 900
+#   docker exec cw_utreexod_v5 sh -c 'ls /data/regtest/blocks_ffldb/*.fdb | wc -l'
+#   docker compose -f poc/docker-compose.regtest-v5.yml stop utreexod
+services:
+  bitcoind:
+    image: bitcoin/bitcoin:30.2
+    container_name: cw_bitcoind_v5
+    command:
+      - -regtest=1
+      - -server=1
+      - -txindex=1
+      - -rpcuser=coconut
+      - -rpcpassword=coconut
+      - -rpcbind=0.0.0.0
+      - -rpcallowip=0.0.0.0/0
+      - -rpcport=18443
+      - -port=18444
+      - -fallbackfee=0.0001
+      - -datacarrier=1
+      - -datacarriersize=100000
+      - -printtoconsole=1
+    ports:
+      - "18455:18443"
+      - "18456:18444"
+    volumes:
+      - bitcoind_v5_data:/home/bitcoin/.bitcoin
+    healthcheck:
+      test: ["CMD", "bitcoin-cli", "-regtest", "-rpcuser=coconut", "-rpcpassword=coconut", "getblockchaininfo"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  utreexod:
+    image: cw-utreexod-lh-v5:poc
+    container_name: cw_utreexod_v5
+    network_mode: "service:bitcoind"
+    depends_on:
+      bitcoind:
+        condition: service_healthy
+    environment:
+      UTREEXOD_POSMAP: "lh"
+      UTREEXOD_POSMAP_STATS: "1"
+      # 64 KiB flat files so prune's keepHeight window is reachable early.
+      UTREEXOD_MAXBLKFILE: "65536"
+    command:
+      - --regtest
+      - --datadir=/data
+      - --rpcuser=coconut
+      - --rpcpass=coconut
+      - --rpclisten=0.0.0.0:18334
+      - --flatutreexoproofindex
+      - --proofonly
+      - --prune=1
+      - --listen=0.0.0.0:18333
+      - --connect=127.0.0.1:18444
+    volumes:
+      - utreexod_v5_data:/data
+    stop_grace_period: 2m
+
+volumes:
+  bitcoind_v5_data:
+    name: cw_bitcoind_v5_data
+  utreexod_v5_data:
+    name: cw_utreexod_v5_data
