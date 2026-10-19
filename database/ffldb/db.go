@@ -2127,8 +2127,9 @@ func (tx *transaction) PruneBlocks(targetSize uint64, keepHeight int32) (int32, 
 	_, _, sjSize, _ := tx.db.sjStore.calcBlockFilesSize()
 
 	// If the total size of block files and spend journal files are under the target,
-	// return early and don't prune.
-	totalSize := uint64(blkSize + sjSize)
+	// return early and don't prune. Both sizes are uint64 from
+	// calcBlockFilesSize, so this does not wrap at 4 GiB.
+	totalSize := blkSize + sjSize
 	if totalSize <= targetSize {
 		return -1, nil
 	}
@@ -2175,7 +2176,7 @@ func (tx *transaction) PruneBlocks(targetSize uint64, keepHeight int32) (int32, 
 			continue
 		}
 
-		deletedSize := uint64(blkSize + stSize)
+		deletedSize := uint64(blkSize) + uint64(stSize)
 		totalSize -= deletedSize
 
 		// Add the block file to be deleted to the list of files pending deletion to

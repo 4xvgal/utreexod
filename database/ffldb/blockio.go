@@ -952,20 +952,23 @@ func (s *blockStore) getCurrentFileNum() uint32 {
 	return wc.curFileNum
 }
 
-// calcBlockFilesSize calculates the total size of all the files.
-func (s *blockStore) calcBlockFilesSize() (uint32, uint32, uint32, error) {
+// calcBlockFilesSize calculates the total size of all the files. The total is
+// uint64 because a database can hold far more than 4 GiB across its flat
+// files (the previous uint32 accumulator wrapped at 4 GiB and made PruneBlocks
+// believe a >4 GiB store was tiny, so it never pruned).
+func (s *blockStore) calcBlockFilesSize() (uint32, uint32, uint64, error) {
 	first, last, err := s.fileStartEndNumFunc()
 	if err != nil {
 		return 0, 0, 0, err
 	}
 
-	totalSize := uint32(0)
-	for i := first; i < last; i++ {
+	totalSize := uint64(0)
+	for i := first; i <= last; i++ {
 		size, err := s.fileSizeFunc(i)
 		if err != nil {
 			return 0, 0, 0, err
 		}
-		totalSize += size
+		totalSize += uint64(size)
 	}
 
 	log.Tracef("Scan found first block file of #%d and the latest "+
