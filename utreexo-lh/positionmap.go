@@ -55,6 +55,9 @@ func (s *swissPMBatch) Insert(h [32]byte, p uint64) error { return s.b.Insert(h,
 // the linear-hashing implementation is not compiled in.
 var lhFactory func(ctrlPath string, expectedEntries uint64, consistencyHash [32]byte, dataFile swisstable.HashSource, posMask uint64) (PositionMap, bool, error)
 
+// ehFactory is set by positionmap_eh.go (linux).
+var ehFactory func(ctrlPath string, expectedEntries uint64, consistencyHash [32]byte, dataFile swisstable.HashSource, posMask uint64) (PositionMap, bool, error)
+
 // newPositionMap builds the position map selected by kind. needsRebuild is true
 // when the on-disk table could not be reused and must be rebuilt from the data
 // file.
@@ -71,6 +74,11 @@ func newPositionMap(kind, ctrlPath, slotsPath string, expectedEntries uint64, co
 			return nil, false, fmt.Errorf("linear hashing not compiled in on this platform")
 		}
 		return lhFactory(ctrlPath, expectedEntries, consistencyHash, dataFile, posMask)
+	case "eh":
+		if ehFactory == nil {
+			return nil, false, fmt.Errorf("extendible hashing not compiled in on this platform")
+		}
+		return ehFactory(ctrlPath, expectedEntries, consistencyHash, dataFile, posMask)
 	default:
 		return nil, false, fmt.Errorf("unknown position map kind %q", kind)
 	}
