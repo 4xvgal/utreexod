@@ -525,7 +525,9 @@ func InitUtreexoState(cfg *UtreexoConfig, chain *blockchain.BlockChain, ttlIdx *
 	if posmapKind == "" {
 		posmapKind = "swiss"
 	}
-	if posmapKind == "lh" {
+	// Both LH and EH grow by incremental splits; a 2^32 presize would
+	// allocate ~90 GB on a fresh database.
+	if posmapKind == "lh" || posmapKind == "eh" {
 		presizeLeaves = 0
 	}
 	log.Infof("Utreexo position map implementation: %s (presizeLeaves=%d)", posmapKind, presizeLeaves)
