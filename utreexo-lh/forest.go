@@ -437,7 +437,7 @@ func newForestWithPosmap(file, blockCountsFile, metaFile *cachedRWS, bitmap *del
 	// to the live count when the deleted bitmap is known. The linear-hashing
 	// map grows by cheap incremental splits, so a small start is safe; the
 	// swiss map keeps its growth hint to avoid O(N) resizes.
-	if posmapKind == "lh" && bitmap != nil && f.NumLeaves > 0 {
+	if (posmapKind == "lh" || posmapKind == "eh") && bitmap != nil && f.NumLeaves > 0 {
 		if live := f.NumLeaves - uint64(bitmap.count()); live > 0 {
 			expectedEntries = live
 		}
