@@ -1,7 +1,9 @@
 package utreexo
 
 import (
+	"encoding/binary"
 	"fmt"
+	"slices"
 	"sync"
 )
 
@@ -85,53 +87,86 @@ func (f *Forest) Record(adds []Hash, delHashes []Hash) ([]int32, []uint64, error
 }
 
 // processDeletions looks up each delHash in positionMap to produce its addIndex
-// and leaf position, then marks each position in the deletedLeafPositions
-// bitmap. The Get fan-out runs in parallel above minParallelSize; the bitmap
-// updates are serial since deletedBitmap.set is not concurrency-safe.
+// and leaf position, marks each position in the deletedLeafPositions bitmap, and
+// drops the spent leaf from the live position map.
+//
+// Both the lookups and the deletes run in position-map bucket order rather than
+// in block order. The map is read through a read-only mmap and mutated with
+// pwrite on a multi-GB file, so a block-order pass faults in a fresh page per
+// hash; ascending bucket order makes a worker's pages contiguous instead. The
+// bucket key is h1 = LittleEndian.Uint64(hash[:8]), which is what both the LH
+// (positionmap_lh.go) and EH (eh.go) layouts hash on, so the sort groups by
+// directory index. Lookups are pure reads and deletes are independent per key,
+// so reordering is free; results scatter back by original index. The Get fan-out
+// is parallel above minParallelSize; the deletes stay serial because the map's
+// count/tombstone counters are not concurrency-safe.
 func (f *Forest) processDeletions(delHashes []Hash) ([]int32, []uint64, error) {
 	addIndexes := make([]int32, len(delHashes))
 	delPositions := make([]uint64, len(delHashes))
 
-	if nDels := len(delHashes); nDels > 0 {
-		if nDels < minParallelSize {
-			for i, delHash := range delHashes {
-				packed, found, err := f.positionMap.Get(delHash)
+	nDels := len(delHashes)
+	if nDels == 0 {
+		return addIndexes, delPositions, nil
+	}
+
+	// order sorts the lookups and deletes into bucket order without moving the
+	// caller-visible results, which stay at their original indexes.
+	order := make([]int, nDels)
+	for i := range order {
+		order[i] = i
+	}
+	slices.SortFunc(order, func(a, b int) int {
+		ha := binary.LittleEndian.Uint64(delHashes[a][:8])
+		hb := binary.LittleEndian.Uint64(delHashes[b][:8])
+		switch {
+		case ha < hb:
+			return -1
+		case ha > hb:
+			return 1
+		default:
+			return 0
+		}
+	})
+
+	if nDels < minParallelSize {
+		for _, oi := range order {
+			packed, found, err := f.positionMap.Get(delHashes[oi])
+			if err != nil {
+				return nil, nil, fmt.Errorf("positionMap.Get: %w", err)
+			}
+			if !found {
+				return nil, nil, fmt.Errorf("delhash %v not found in position map", delHashes[oi])
+			}
+			addIndexes[oi] = unpackIndex(packed)
+			delPositions[oi] = unpackPos(packed)
+		}
+	} else {
+		errs := make([]error, numWorkers)
+		MainParallelDo(func(wIdx, s, e int) {
+			for k := s; k < e; k++ {
+				oi := order[k]
+				packed, found, err := f.positionMap.Get(delHashes[oi])
 				if err != nil {
-					return nil, nil, fmt.Errorf("positionMap.Get: %w", err)
+					errs[wIdx] = fmt.Errorf("positionMap.Get: %w", err)
+					return
 				}
 				if !found {
-					return nil, nil, fmt.Errorf("delhash %v not found in position map", delHash)
+					errs[wIdx] = fmt.Errorf("delhash %v not found in position map", delHashes[oi])
+					return
 				}
-				addIndexes[i] = unpackIndex(packed)
-				delPositions[i] = unpackPos(packed)
+				addIndexes[oi] = unpackIndex(packed)
+				delPositions[oi] = unpackPos(packed)
 			}
-		} else {
-			errs := make([]error, numWorkers)
-			MainParallelDo(func(wIdx, s, e int) {
-				for i := s; i < e; i++ {
-					packed, found, err := f.positionMap.Get(delHashes[i])
-					if err != nil {
-						errs[wIdx] = fmt.Errorf("positionMap.Get: %w", err)
-						return
-					}
-					if !found {
-						errs[wIdx] = fmt.Errorf("delhash %v not found in position map", delHashes[i])
-						return
-					}
-					addIndexes[i] = unpackIndex(packed)
-					delPositions[i] = unpackPos(packed)
-				}
-			}, nDels)
-			for _, err := range errs {
-				if err != nil {
-					return nil, nil, err
-				}
+		}, nDels)
+		for _, err := range errs {
+			if err != nil {
+				return nil, nil, err
 			}
 		}
 	}
 
-	for i, pos := range delPositions {
-		f.deletedLeafPositions.set(pos)
+	for _, oi := range order {
+		f.deletedLeafPositions.set(delPositions[oi])
 		// Drop the spent leaf from the live map. Undo re-inserts it from the
 		// packed values the caller recorded; RehashAndProve consumes the
 		// positions returned here, so no later map lookup is needed.
@@ -139,7 +174,7 @@ func (f *Forest) processDeletions(delHashes []Hash) ([]int32, []uint64, error) {
 		// the map ahead of the WAL and replay would not find the delhash. A
 		// forced rebuild on next open (or journaling deletes) fixes it; the
 		// lab only restarts gracefully, where Close syncs the map header.
-		if _, err := f.positionMap.Delete(delHashes[i]); err != nil {
+		if _, err := f.positionMap.Delete(delHashes[oi]); err != nil {
 			return nil, nil, fmt.Errorf("positionMap.Delete: %w", err)
 		}
 	}
