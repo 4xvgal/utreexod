@@ -36,13 +36,8 @@ const (
 	lhBucketSlots  = 128
 	lhKeyPrefixLen = 12
 	lhSlotSize     = 8 + lhKeyPrefixLen // packed value + key prefix
-	// Buckets are one page each: the header occupies the first page and every
-	// bucket starts on a page boundary, so a random insert dirties exactly one
-	// 4 KiB page instead of straddling two (the map is the dominant random-write
-	// source, so this cuts its write I/Os by ~40%). The used part of a bucket is
-	// lhBucketSlots + lhBucketSlots*lhSlotSize = 2688 bytes; the rest is slack.
-	lhHeaderSize = 4096
-	lhBucketSize = 4096
+	lhHeaderSize   = 64
+	lhBucketSize   = lhBucketSlots + lhBucketSlots*lhSlotSize
 
 	lhOffMagic = 0
 	lhOffLevel = 8
@@ -51,9 +46,9 @@ const (
 	lhOffHash  = 32
 )
 
-// lhMagic is bumped to "LH5" for the one-page-bucket layout. Earlier magics
-// ("LH4" live-only, "LH3" 12B key prefix) fail the check and rebuild once.
-var lhMagic = [8]byte{'L', 'H', '5'}
+// lhMagic is bumped to "LH4" for the live-only map: spent leaves are now
+// removed, so a v3 file holds cumulative entries and must be rebuilt once.
+var lhMagic = [8]byte{'L', 'H', '4'}
 
 var lhZeroPrefix [lhKeyPrefixLen]byte
 

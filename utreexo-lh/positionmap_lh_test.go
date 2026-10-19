@@ -78,8 +78,8 @@ func TestLHPositionMapKeyPrefix(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.Close()
-	if string(magic[:3]) != "LH5" {
-		t.Fatalf("magic = %q, want LH5", magic[:3])
+	if string(magic[:3]) != "LH4" {
+		t.Fatalf("magic = %q, want LH4", magic[:3])
 	}
 
 	if err := m.SetConsistencyHash(consistency); err != nil {
@@ -158,19 +158,5 @@ func TestLHPositionMapBatch(t *testing.T) {
 		if err != nil || !ok || p != uint64(i) {
 			t.Fatalf("get %d: p=%d ok=%v err=%v", i, p, ok, err)
 		}
-	}
-}
-
-// TestLHBucketPageAligned pins the one-page-bucket layout: the header and every
-// bucket start on a 4 KiB page and the bucket payload fits in that page, so a
-// random insert dirties exactly one page.
-func TestLHBucketPageAligned(t *testing.T) {
-	const page = 4096
-	if lhHeaderSize%page != 0 || lhBucketSize%page != 0 {
-		t.Fatalf("layout not page aligned: header=%d bucket=%d", lhHeaderSize, lhBucketSize)
-	}
-	if lhBucketSlots+lhBucketSlots*lhSlotSize > lhBucketSize {
-		t.Fatalf("bucket payload %d exceeds bucket size %d",
-			lhBucketSlots+lhBucketSlots*lhSlotSize, lhBucketSize)
 	}
 }
