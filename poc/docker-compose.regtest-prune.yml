@@ -1,0 +1,10 @@
+# Override for the undo-prune stack: use the branch image and force the
+# physical compaction path so the regtest can observe undo.dat shrink.
+#
+#   docker compose -p cw-rc -f poc/docker-compose.regtest-eh.yml \
+#     -f poc/docker-compose.regtest-prune.yml up -d
+services:
+  utreexod:
+    image: cw-utreexod-undoprune:poc
+    environment:
+      UTREEXOD_UNDO_PRUNE_THRESHOLD: "0"

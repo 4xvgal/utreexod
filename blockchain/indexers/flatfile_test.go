@@ -1086,3 +1086,53 @@ func TestStoreFailureDoesNotPublishOffset(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, int64(8), info.Size())
 }
+
+// TestPruneBelow checks that records below the floor stop being served, that a
+// compaction reclaims the dead prefix, and that both the kept suffix and the
+// floor survive a reopen.
+func TestPruneBelow(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "prune")
+	name := "data"
+
+	ff := NewFlatFileState()
+	ff.prunable = true
+	require.NoError(t, ff.Init(path, name))
+
+	const n = 20
+	const c = 100
+	for i := int32(1); i <= n; i++ {
+		require.NoError(t, ff.StoreData(i, bytes.Repeat([]byte{byte(i)}, c)))
+	}
+
+	// A zero threshold forces the physical compaction path.
+	require.NoError(t, ff.PruneBelow(11, 0))
+
+	for h := int32(1); h < 11; h++ {
+		got, err := ff.FetchData(h)
+		require.NoError(t, err)
+		require.Nil(t, got, "height %d should be pruned", h)
+	}
+	for h := int32(11); h <= n; h++ {
+		got, err := ff.FetchData(h)
+		require.NoError(t, err)
+		require.Len(t, got, c)
+		require.Equal(t, byte(h), got[0], "height %d payload", h)
+	}
+
+	// Reopen from disk: the floor and the kept suffix must survive.
+	ff2 := NewFlatFileState()
+	ff2.prunable = true
+	require.NoError(t, ff2.Init(path, name))
+	got, err := ff2.FetchData(10)
+	require.NoError(t, err)
+	require.Nil(t, got, "pruned height survived a restart")
+	got, err = ff2.FetchData(11)
+	require.NoError(t, err)
+	require.Len(t, got, c)
+	require.Equal(t, byte(11), got[0])
+
+	// Appending after a compaction must still work.
+	require.NoError(t, ff2.StoreData(n+1, bytes.Repeat([]byte{0xAB}, c)))
+}

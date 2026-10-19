@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"time"
 
@@ -74,6 +75,23 @@ const (
 	// size of a uint32. Shame go std lib doesn't provide it.
 	uint32Size = 4
 )
+
+// undoWindow is the number of recent blocks whose undo records are retained.
+// 288 is the NODE_NETWORK_LIMITED basis the chain already assumes for reorgs;
+// deeper reorgs require a reindex.
+const undoWindow = int32(288)
+
+// undoPruneThreshold returns how many dead bytes may accumulate before a
+// physical compaction. A smaller threshold trades I/O for a tighter file.
+func undoPruneThreshold() int64 {
+	const def = 64 << 20
+	if v := os.Getenv("UTREEXOD_UNDO_PRUNE_THRESHOLD"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n >= 0 {
+			return n
+		}
+	}
+	return def
+}
 
 var (
 	// flatUtreexoBucketKey is the name of the flat utreexo proof
@@ -1230,6 +1248,18 @@ func (idx *FlatUtreexoProofIndex) DisconnectBlock(dbTx database.Tx, block *btcut
 //
 // This is part of the Indexer interface.
 func (idx *FlatUtreexoProofIndex) PruneBlock(_ database.Tx, _ *chainhash.Hash, lastKeptHeight int32) error {
+	// Reclaim undo records older than the reorg window. The block prune already
+	// keeps tip-287, so align with it and never drop past it. Without this the
+	// undo index grows with every block for the life of the node.
+	tip := idx.chain.BestSnapshot().Height
+	below := lastKeptHeight
+	if minBelow := tip - undoWindow; below > minBelow {
+		below = minBelow
+	}
+	if err := idx.undoState.PruneBelow(below, undoPruneThreshold()); err != nil {
+		return err
+	}
+
 	consistencyHash, err := idx.utreexoState.state.ReadConsistencyHash()
 	if err != nil {
 		return err
@@ -1911,6 +1941,9 @@ func flatFilePath(dataDir, dataName string) string {
 func loadFlatFileState(dataDir, name string) (*FlatFileState, error) {
 	path := flatFilePath(dataDir, name)
 	ff := NewFlatFileState()
+	if name == flatUtreexoUndoName {
+		ff.prunable = true
+	}
 
 	err := ff.Init(path, name)
 	if err != nil {

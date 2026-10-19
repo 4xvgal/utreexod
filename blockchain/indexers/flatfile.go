@@ -25,6 +25,10 @@ const (
 
 	// dataFileSuffix is the suffix given to the dataFile name.
 	dataFileSuffix = ".dat"
+
+	// floorFileName persists the lowest height a prunable FlatFileState still
+	// serves. Records below it are dropped by PruneBelow.
+	floorFileName = "floor.dat"
 )
 
 var (
@@ -57,6 +61,19 @@ type FlatFileState struct {
 	// NOTE Since we account for the genesis block in the offsets, to fetch data for
 	// height x, you'd do 'offsets[x]' and not 'offsets[x-1]'.
 	offsets []int64
+
+	// dataPath is the data file path, kept so PruneBelow can rewrite it.
+	dataPath string
+
+	// floorHeight is the lowest height still served. Entries below it have
+	// been pruned; FetchData returns nil for them.
+	floorHeight int32
+
+	// prunable enables PruneBelow and the floor sidecar for this state.
+	prunable bool
+
+	// floorFile persists floorHeight across restarts.
+	floorFile *os.File
 }
 
 // recoverOffsetFile recovers the offset file to the latest readable offset.
@@ -70,7 +87,7 @@ func (ff *FlatFileState) recoverOffsetFile(fileSize int64) error {
 func (ff *FlatFileState) recover() error {
 	log.Infof("Recovering flatfile as it's not consistent")
 	buf := make([]byte, 8)
-	for ; ff.currentHeight > 0; ff.currentHeight-- {
+	for ; ff.currentHeight > ff.floorHeight; ff.currentHeight-- {
 		// Read from the dataFile.  This read will grab the magic bytes and the
 		// size bytes.
 		offset := ff.offsets[ff.currentHeight]
@@ -127,8 +144,17 @@ func (ff *FlatFileState) recover() error {
 		ff.offsets = ff.offsets[:len(ff.offsets)-1]
 	}
 
-	// No record survived. Reset the append cursor as well as the file so a
-	// subsequent store cannot leave a hole at the beginning of the index.
+	// No record survived. A pruned prefix cannot be recreated, so keep the
+	// file and resume appending at its end; otherwise reset to a clean file so
+	// a subsequent store cannot leave a hole at the beginning of the index.
+	if ff.floorHeight > 0 {
+		off, err := ff.dataFile.Seek(0, 2)
+		if err != nil {
+			return err
+		}
+		ff.currentOffset = off
+		return nil
+	}
 	ff.currentOffset = 0
 	return ff.dataFile.Truncate(0)
 }
@@ -154,6 +180,12 @@ func (ff *FlatFileState) Init(path, dataName string) error {
 	ff.dataFile, err = os.OpenFile(dataPath, os.O_CREATE|os.O_RDWR, 0600)
 	if err != nil {
 		return err
+	}
+	ff.dataPath = dataPath
+	if ff.prunable {
+		if err := ff.loadFloor(filepath.Dir(dataPath)); err != nil {
+			return err
+		}
 	}
 
 	// Seek to end to get the number of offsets in the file (# of blocks).
@@ -294,8 +326,9 @@ func (ff *FlatFileState) OverWrite(height, offset int32, data []byte) error {
 // many records in a row can hold the lock once across the batch instead of
 // reacquiring it for every record.
 func (ff *FlatFileState) overwriteLocked(height, offset int32, data []byte) error {
-	// If the height requsted is greater than the best height, return an error.
-	if height > ff.currentHeight || height <= 0 {
+	// If the height requested is pruned or greater than the best height,
+	// return an error.
+	if height > ff.currentHeight || height < ff.floorHeight || height <= 0 {
 		return fmt.Errorf("Best height is %v, can't overwrite at height %v",
 			ff.currentHeight, height)
 	}
@@ -340,9 +373,9 @@ func (ff *FlatFileState) FetchData(height int32) ([]byte, error) {
 	ff.mtx.RLock()
 	defer ff.mtx.RUnlock()
 
-	// If the height requsted is greater than the one we have saved,
-	// just return nil.
-	if height > ff.currentHeight || height <= 0 {
+	// If the height requested is pruned or greater than the one we have
+	// saved, just return nil.
+	if height > ff.currentHeight || height < ff.floorHeight || height <= 0 {
 		return nil, nil
 	}
 
@@ -464,6 +497,123 @@ func deleteFlatFile(path string) error {
 		log.Infof("No flatfiles to delete")
 	}
 	return os.RemoveAll(path)
+}
+
+// loadFloor opens the floor sidecar and restores the persisted floor height.
+func (ff *FlatFileState) loadFloor(dir string) error {
+	f, err := os.OpenFile(filepath.Join(dir, floorFileName), os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return err
+	}
+	ff.floorFile = f
+	var buf [4]byte
+	if n, err := f.ReadAt(buf[:], 0); err == nil && n == 4 {
+		ff.floorHeight = int32(binary.BigEndian.Uint32(buf[:]))
+	}
+	return nil
+}
+
+// persistFloor stores floorHeight so a restart does not serve pruned heights.
+func (ff *FlatFileState) persistFloor() error {
+	if ff.floorFile == nil {
+		return nil
+	}
+	var buf [4]byte
+	binary.BigEndian.PutUint32(buf[:], uint32(ff.floorHeight))
+	if _, err := ff.floorFile.WriteAt(buf[:], 0); err != nil {
+		return err
+	}
+	return ff.floorFile.Sync()
+}
+
+// PruneBelow stops serving heights below 'below' and, once the dead prefix
+// passes 'threshold' bytes, reclaims it by rewriting the data and offset files
+// to hold only the kept suffix. Records below the floor are never served again,
+// so a rewrite keeps the on-disk size bounded by the retained window plus one
+// threshold. When the dead prefix is still small the floor advances logically
+// and the bytes are reclaimed by a later call.
+func (ff *FlatFileState) PruneBelow(below int32, threshold int64) error {
+	ff.mtx.Lock()
+	defer ff.mtx.Unlock()
+
+	if below <= 0 || below > ff.currentHeight || below <= ff.floorHeight {
+		return nil
+	}
+
+	drop := ff.offsets[below]
+	if drop <= 0 || drop < threshold {
+		ff.floorHeight = below
+		return ff.persistFloor()
+	}
+
+	size, err := ff.dataFile.Seek(0, 2)
+	if err != nil {
+		return err
+	}
+
+	tmpPath := ff.dataPath + ".prune"
+	tmp, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_TRUNC|os.O_RDWR, 0600)
+	if err != nil {
+		return err
+	}
+	buf := make([]byte, 1<<20)
+	for off := drop; off < size; {
+		n := int64(len(buf))
+		if size-off < n {
+			n = size - off
+		}
+		chunk := int(n)
+		if _, err := ff.dataFile.ReadAt(buf[:chunk], off); err != nil {
+			tmp.Close()
+			os.Remove(tmpPath)
+			return err
+		}
+		if _, err := tmp.WriteAt(buf[:chunk], off-drop); err != nil {
+			tmp.Close()
+			os.Remove(tmpPath)
+			return err
+		}
+		off += n
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		os.Remove(tmpPath)
+		return err
+	}
+	tmp.Close()
+
+	if err := ff.dataFile.Close(); err != nil {
+		os.Remove(tmpPath)
+		return err
+	}
+	if err := os.Rename(tmpPath, ff.dataPath); err != nil {
+		return err
+	}
+	ff.dataFile, err = os.OpenFile(ff.dataPath, os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return err
+	}
+
+	for h := int(below); h <= int(ff.currentHeight); h++ {
+		ff.offsets[h] -= drop
+	}
+	for h := 0; h < int(below); h++ {
+		ff.offsets[h] = 0
+	}
+	var buf8 [8]byte
+	for h := 0; h <= int(ff.currentHeight); h++ {
+		binary.BigEndian.PutUint64(buf8[:], uint64(ff.offsets[h]))
+		if _, err := ff.offsetFile.WriteAt(buf8[:], int64(h)*8); err != nil {
+			return err
+		}
+	}
+	if err := ff.offsetFile.Sync(); err != nil {
+		return err
+	}
+
+	ff.currentOffset -= drop
+	ff.floorHeight = below
+	return ff.persistFloor()
 }
 
 // NewFlatFileState returns a new but uninitialized FlatFileState.
