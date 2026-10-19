@@ -1,0 +1,74 @@
+# LH v4 live-only position map: regtest validation stack.
+#
+#   bitcoind (regtest, mines/RPC)
+#        │ 127.0.0.1:18444 (netns shared with utreexod)
+#        ▼
+#   utreexod (regtest, --flatutreexoproofindex, UTREEXOD_POSMAP=lh, prune)
+#
+# The flat proof index + prune exercises the storeUndoBlock / Undo path that
+# the live-only position map changed. Bitcoind mines via regtest.sh.
+#
+#   docker compose -f poc/docker-compose.regtest-v4.yml up -d
+#   ./poc/regtest-v4.sh mine 921
+#   ./poc/regtest-v4.sh status
+#   docker compose -f poc/docker-compose.regtest-v4.yml stop utreexod   # graceful
+services:
+  bitcoind:
+    image: bitcoin/bitcoin:30.2
+    container_name: cw_bitcoind_v4
+    command:
+      - -regtest=1
+      - -server=1
+      - -txindex=1
+      - -rpcuser=coconut
+      - -rpcpassword=coconut
+      - -rpcbind=0.0.0.0
+      - -rpcallowip=0.0.0.0/0
+      - -rpcport=18443
+      - -port=18444
+      - -fallbackfee=0.0001
+      - -printtoconsole=1
+    ports:
+      - "18453:18443"
+      - "18454:18444"
+      - "18334:18334"
+    volumes:
+      - bitcoind_v4_data:/home/bitcoin/.bitcoin
+    healthcheck:
+      test: ["CMD", "bitcoin-cli", "-regtest", "-rpcuser=coconut", "-rpcpassword=coconut", "getblockchaininfo"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  utreexod:
+    image: cw-utreexod-lh-v4:poc
+    container_name: cw_utreexod_v4
+    network_mode: "service:bitcoind"
+    depends_on:
+      bitcoind:
+        condition: service_healthy
+    environment:
+      # Linear-hashing live-only position map (magic LH4).
+      UTREEXOD_POSMAP: "lh"
+      # Per-op counters; needed for the placeFull=0 / count checks.
+      UTREEXOD_POSMAP_STATS: "1"
+    command:
+      - --regtest
+      - --datadir=/data
+      - --rpcuser=coconut
+      - --rpcpass=coconut
+      - --rpclisten=0.0.0.0:18334
+      - --flatutreexoproofindex
+      - --proofonly
+      - --prune=550
+      - --listen=0.0.0.0:18333
+      - --connect=127.0.0.1:18444
+    volumes:
+      - utreexod_v4_data:/data
+    stop_grace_period: 2m
+
+volumes:
+  bitcoind_v4_data:
+    name: cw_bitcoind_v4_data
+  utreexod_v4_data:
+    name: cw_utreexod_v4_data

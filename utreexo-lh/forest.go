@@ -430,6 +430,19 @@ func newForestWithPosmap(file, blockCountsFile, metaFile *cachedRWS, bitmap *del
 	if expectedMaxLeaves == 0 {
 		expectedEntries = max(expectedEntries, 1<<16)
 	}
+
+	// On a rebuild the map receives only live leaves (rebuildPositionMap
+	// skips spent positions), so presizing to the cumulative NumLeaves would
+	// recreate the oversized table the live-only map exists to remove. Size
+	// to the live count when the deleted bitmap is known. The linear-hashing
+	// map grows by cheap incremental splits, so a small start is safe; the
+	// swiss map keeps its growth hint to avoid O(N) resizes.
+	if posmapKind == "lh" && bitmap != nil && f.NumLeaves > 0 {
+		if live := f.NumLeaves - uint64(bitmap.count()); live > 0 {
+			expectedEntries = live
+		}
+	}
+
 	posMap, needsRebuild, err := newPositionMap(posmapKind, posMapCtrlPath, posMapSlotsPath, expectedEntries, consistencyHash, file, positionMask)
 	if err != nil {
 		return nil, fmt.Errorf("create position map: %w", err)
