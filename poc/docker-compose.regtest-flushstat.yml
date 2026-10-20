@@ -46,6 +46,8 @@ services:
       UTREEXOD_POSMAP: "eh"
       UTREEXO_EH_LOAD: "0.80"
       UTREEXO_WALSTAT: "1"
+      # Dense (entry-indexed) WAL cache switch: default off, same binary A/B.
+      UTREEXO_WAL_DENSE: "${WAL_DENSE:-}"
       UTREEXOD_ALLOW_SMALL_PROOFINDEX_CACHE: "1"
     command:
       - --regtest
