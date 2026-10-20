@@ -179,13 +179,14 @@ func (ms *mapSlice) deleteMaps() {
 	ms.maps = ms.maps[:1]
 }
 
-const (
-	// UtxoFlushPeriodicInterval is the interval at which a flush is performed
-	// when the flush mode FlushPeriodic is used.  This is used when the initial
-	// block download is complete and it's useful to flush periodically in case
-	// of unforseen shutdowns.
-	UtxoFlushPeriodicInterval = time.Minute * 5
-)
+// UtxoFlushPeriodicInterval is the interval at which a flush is performed
+// when the flush mode FlushPeriodic is used.  This is used when the initial
+// block download is complete and it's useful to flush periodically in case
+// of unforseen shutdowns.
+//
+// ponytail: var instead of const so a measurement build can widen the WAL
+// cache window (UTREEXOD_UTXO_FLUSH_INTERVAL); same binary, default unchanged.
+var UtxoFlushPeriodicInterval = time.Minute * 5
 
 // FlushMode is used to indicate the different urgency types for a flush.
 type FlushMode uint8

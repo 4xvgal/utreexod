@@ -27,6 +27,26 @@ const (
 	utreexoDirName = "utreexostate"
 )
 
+// ponytail: measurement-only override. The default 5m periodic flush caps the
+// utreexo WAL cache window at whatever fits in 5 minutes (~4M entries at
+// low mainnet heights), so the cache never reaches its --utreexoproofindexmaxmemory
+// budget and the 3.36 GB / 100 B-per-entry anchor condition cannot be
+// reproduced. Widening the interval makes the budget the binding trigger.
+// Unset (or invalid) keeps the default.
+func init() {
+	v := os.Getenv("UTREEXOD_UTXO_FLUSH_INTERVAL")
+	if v == "" {
+		return
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d <= 0 {
+		log.Warnf("ignoring UTREEXOD_UTXO_FLUSH_INTERVAL=%q: %v", v, err)
+		return
+	}
+	blockchain.UtxoFlushPeriodicInterval = d
+	log.Infof("measurement: UtxoFlushPeriodicInterval overridden to %v", d)
+}
+
 // UtreexoConfig is a descriptor which specifies the Utreexo state instance configuration.
 type UtreexoConfig struct {
 	// MaxMemoryUsage is the desired memory usage for the utreexo state cache.
