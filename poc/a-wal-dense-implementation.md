@@ -1,7 +1,7 @@
 # A 구현/검증 — WAL mmap 캐시 dense packing
 
-측정일 2026-10-20. 브랜치 `lab/a-wal-dense` (기준 `poc/eh-readcoalesce` abb97e42,
-계측 코드는 `lab/flushstat-a` 커밋 d36be187에 보존). 라이브러리는 in-repo 사본
+측정일 2026-10-20. 브랜치 `poc/eh-a-dense-1020` (tag `a-dense-v1-1020`), 기준
+`poc/eh-readcoalesce` abb97e42, 계측 코드는 `poc/eh-flushstat-a-1020` 커밋 d36be187에 보존. 라이브러리는 in-repo 사본
 `./utreexo-lh`. 테스트/빌드는 Docker `golang:1.25-bookworm` (arm64), regtest는 OrbStack.
 
 ## 0. 한 줄
