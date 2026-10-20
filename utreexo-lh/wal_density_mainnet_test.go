@@ -49,9 +49,12 @@ func densityParent(pos uint64) uint64 { return (pos >> 1) | (uint64(1) << densit
 
 // TestWALCacheDensityMainnetShape verifies candidate A on the real mmapcache
 // with mainnet-shaped offsets: leaves appended sequentially (row 0) and each
-// deletion walking ~24 ancestors whose offsets sit in other rows, 512 GiB
-// apart. It measures the resident bytes of the 1 TB anon cache region and
-// compares with dense (entry-indexed) packing of the same entry count.
+// deletion walking ~24 ancestors, whose offsets land in other rows. Rows are
+// not a fixed stride apart -- rowBaseOffset shrinks geometrically (row 0 at
+// 549 GB, row 34 at 64 B, everything inside ~1.1 TB) -- so the waste comes
+// from positions being sparse inside a row, not from gaps between rows.
+// It measures the resident bytes of the 1 TB anon cache region and compares
+// with dense (entry-indexed) packing of the same entry count.
 //
 //	go test -run TestWALCacheDensityMainnetShape -v .
 func TestWALCacheDensityMainnetShape(t *testing.T) {

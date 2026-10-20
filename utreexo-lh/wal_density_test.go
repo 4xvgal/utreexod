@@ -16,9 +16,14 @@ import (
 var smapsHeader = regexp.MustCompile(`^([0-9a-f]+)-([0-9a-f]+) (\S+) `)
 
 // TestWALCacheDensity measures candidate A's claim about the WAL mmap cache:
-// entries are addressed by file offset and the forest's interior rows sit
-// 512 GiB apart, so a block's log2(N) interior writes land on pages that hold
-// only a few of their 128 possible entries.
+// entries are addressed by file offset, so a block's log2(N) interior writes
+// land on pages that hold only a few of their 128 possible entries.
+//
+// The waste is NOT row spacing: rowBaseOffset shrinks geometrically (capBits
+// 34 puts row 0 at 549 GB and row 34 at 64 B, the whole layout inside ~1.1 TB),
+// so rows are adjacent-ish. It is intra-row sparseness: row 1 holds 346M slots
+// (~11 GB) at mainnet scale while one flush window touches a few hundred
+// thousand of them.
 //
 //	go test -run TestWALCacheDensity -v .
 func TestWALCacheDensity(t *testing.T) {

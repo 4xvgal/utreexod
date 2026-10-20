@@ -68,6 +68,11 @@ type cachedRWS struct {
 // mmapfile.Open). entrySize specifies the fixed record size (4, 8, or 32
 // bytes). maxCacheBytes controls when overflowed() signals that a flush
 // is needed; if 0, defaultMaxCacheMemory is used.
+//
+// The entry budget is decided by the store: the dense store
+// (UTREEXO_WAL_DENSE=1) charges entrySize+16 per entry for its offset table
+// and index, so the same maxCacheBytes holds ~2/3 as many 32-byte entries and
+// flushes ~1.5x more often (each flush costs ~50 ms of fixed overhead).
 func newCachedRWS(underlying forestFile, entrySize int, maxCacheBytes, initialSize int64) (*cachedRWS, error) {
 	if maxCacheBytes <= 0 {
 		maxCacheBytes = defaultMaxCacheMemory
