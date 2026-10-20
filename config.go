@@ -985,10 +985,16 @@ func loadConfig() (*config, []string, error) {
 		return nil, nil, err
 	}
 
-	if cfg.UtreexoProofIndexMaxMemory < 250 {
+	// ponytail: flushstat measurement build -- lets a regtest reach the flush
+	// path in seconds instead of accumulating 250 MiB. Never ship.
+	minProofIndexCacheMiB := int64(250)
+	if os.Getenv("UTREEXOD_ALLOW_SMALL_PROOFINDEX_CACHE") != "" {
+		minProofIndexCacheMiB = 8
+	}
+	if cfg.UtreexoProofIndexMaxMemory < minProofIndexCacheMiB {
 		err := fmt.Errorf("%s: the --utreexoproofindexmaxmemory "+
-			"option may not be less than 250",
-			funcName)
+			"option may not be less than %d",
+			funcName, minProofIndexCacheMiB)
 		fmt.Fprintln(os.Stderr, err)
 		fmt.Fprintln(os.Stderr, usageMessage)
 		return nil, nil, err

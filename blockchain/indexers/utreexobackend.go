@@ -197,12 +197,18 @@ func (idx *FlatUtreexoProofIndex) Flush(bestHash *chainhash.Hash, mode blockchai
 		// Purposely left empty.
 	}
 
+	// ponytail: FLUSHSTAT phase timing (measurement only). Answers which phase of
+	// the flush stalls the pipeline; remove once H3 is decided.
+	flushStart := time.Now()
+	flushDrain, flushFlatSync, flushMainDB := flushStart, flushStart, flushStart
+
 	// Catch the proof pipeline up so the committed state is exactly the
 	// post-block state of bestHash. Crash recovery replays the blocks
 	// after that label on top of whatever this flush commits.
 	if err := idx.drainProofPipeline(); err != nil {
 		return err
 	}
+	flushDrain = time.Now()
 
 	// ponytail: same self-deadlock fix as UtreexoProofIndex.Flush: skip the
 	// synchronous main-db flush when already inside a database transaction.
@@ -223,6 +229,7 @@ func (idx *FlatUtreexoProofIndex) Flush(bestHash *chainhash.Hash, mode blockchai
 				return err
 			}
 		}
+		flushFlatSync = time.Now()
 
 		// Flush the main database first. This is because the block and other data may still
 		// be in the database cache. If we flush the utreexo state before, there's no way to
@@ -237,11 +244,20 @@ func (idx *FlatUtreexoProofIndex) Flush(bestHash *chainhash.Hash, mode blockchai
 		if err != nil {
 			return err
 		}
+		flushMainDB = time.Now()
 	}
+	flushUtreexoStart := time.Now()
 	err := idx.flushUtreexoState(bestHash)
 	if err != nil {
 		return err
 	}
+
+	log.Infof("FLUSHSTAT total=%v drain=%v flatSync=%v mainDB=%v utreexo=%v",
+		time.Since(flushStart).Round(time.Millisecond),
+		flushDrain.Sub(flushStart).Round(time.Millisecond),
+		flushFlatSync.Sub(flushDrain).Round(time.Millisecond),
+		flushMainDB.Sub(flushFlatSync).Round(time.Millisecond),
+		time.Since(flushUtreexoStart).Round(time.Millisecond))
 
 	// Set the last flush time as now as the flush was successful.
 	idx.lastFlushTime = time.Now()

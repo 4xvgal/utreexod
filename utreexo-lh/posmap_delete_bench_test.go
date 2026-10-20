@@ -72,6 +72,12 @@ func BenchmarkProcessDeletionsReorder(b *testing.B) {
 
 	f := &Forest{positionMap: pm, deletedLeafPositions: newDeletedBitmap(n)}
 
+	// BENCH_DROP evicts the map from the page cache before each timed pass, so
+	// every lookup is a real miss instead of a warm-cache hit picked up from a
+	// previous container. Without it the A/B measures syscalls, not I/O.
+	drop := os.Getenv("BENCH_DROP") != ""
+	reset := os.Getenv("BENCH_RESET") != ""
+
 	rng := uint64(0x12345678)
 	next := func() uint64 { rng = splitmix(rng); return rng }
 
@@ -91,6 +97,18 @@ func BenchmarkProcessDeletionsReorder(b *testing.B) {
 			idx := next() % n
 			delsIdx[j] = idx
 			dels[j] = benchHash(idx)
+		}
+		if drop {
+			if d, ok := pm.(interface{ DropCache() }); ok {
+				d.DropCache()
+			}
+		}
+		if reset {
+			if r, ok := pm.(interface{ ResetCache() error }); ok {
+				if err := r.ResetCache(); err != nil {
+					b.Fatal(err)
+				}
+			}
 		}
 		b.StartTimer()
 

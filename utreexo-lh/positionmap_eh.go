@@ -26,6 +26,13 @@ func (e *ehPM) ForEach(fn func(uint64))              { e.m.ForEach(fn) }
 func (e *ehPM) Close() error                         { return e.m.Close() }
 func (e *ehPM) SetConsistencyHash(h [32]byte) error  { return e.m.SetConsistencyHash(h) }
 
+// Prefetch lets the Forest start the bucket reads for a sorted batch ahead of
+// the Get fan-out (H2 experiment).
+func (e *ehPM) Prefetch(h [32]byte) { e.m.Prefetch(h) }
+
+// ResetCache forces the next pass to start cold (bench only).
+func (e *ehPM) ResetCache() error { return e.m.ResetCache() }
+
 type ehPMBatch struct{ m *eh.EHMap }
 
 func (b *ehPMBatch) Insert(h [32]byte, p uint64) error { return b.m.Set(h, p) }

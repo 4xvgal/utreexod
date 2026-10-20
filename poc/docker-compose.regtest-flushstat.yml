@@ -1,0 +1,68 @@
+# H3 flush-stall instrumentation stack (branch poc/eh-readcoalesce + FLUSHSTAT).
+#
+# Isolated from the other regtest stacks (own bitcoind volume, own utreexod
+# volume, own container names) so it never touches the prune/v4/v5/eh stacks.
+#
+#   docker compose -f poc/docker-compose.regtest-flushstat.yml up -d --build utreexod
+#   python3 poc/flushstat-mine.py 20 200
+#   docker logs cw_utreexod_flushstat 2>&1 | grep -E 'FLUSHSTAT|WALFLUSH'
+#
+# CACHE_MIB drives both the utreexo proof-index cache budget and therefore the
+# flush period. Sweep it (8 / 32 / 128) to see which flush phase scales with
+# the payload and which is fixed overhead.
+services:
+  bitcoind:
+    image: bitcoin/bitcoin:30.2
+    container_name: cw_bitcoind_flushstat
+    command:
+      - -regtest=1
+      - -server=1
+      - -txindex=1
+      - -rpcuser=coconut
+      - -rpcpassword=coconut
+      - -rpcbind=0.0.0.0
+      - -rpcallowip=0.0.0.0/0
+      - -rpcport=18443
+      - -port=18444
+      - -fallbackfee=0.0001
+      - -printtoconsole=1
+    ports:
+      - "18445:18443"
+      - "18446:18444"
+    healthcheck:
+      test: ["CMD", "bitcoin-cli", "-regtest", "-rpcuser=coconut", "-rpcpassword=coconut", "getblockchaininfo"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  utreexod:
+    image: cw-utreexod-flushstat:poc
+    container_name: cw_utreexod_flushstat
+    network_mode: "service:bitcoind"
+    depends_on:
+      bitcoind:
+        condition: service_healthy
+    environment:
+      UTREEXOD_POSMAP: "eh"
+      UTREEXO_EH_LOAD: "0.80"
+      UTREEXO_WALSTAT: "1"
+      UTREEXOD_ALLOW_SMALL_PROOFINDEX_CACHE: "1"
+    command:
+      - --regtest
+      - --datadir=/data
+      - --rpcuser=coconut
+      - --rpcpass=coconut
+      - --rpclisten=0.0.0.0:18334
+      - --flatutreexoproofindex
+      - --proofonly
+      - --prune=550
+      - --listen=0.0.0.0:18333
+      - --connect=127.0.0.1:18444
+      - --utreexoproofindexmaxmemory=${CACHE_MIB:-8}
+    volumes:
+      - utreexod_flushstat_data:/data
+    stop_grace_period: 2m
+
+volumes:
+  utreexod_flushstat_data:
+    name: cw_utreexod_flushstat_data

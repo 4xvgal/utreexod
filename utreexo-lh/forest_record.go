@@ -3,6 +3,7 @@ package utreexo
 import (
 	"encoding/binary"
 	"fmt"
+	"os"
 	"slices"
 	"sync"
 )
@@ -148,6 +149,17 @@ func (f *Forest) processDeletions(delHashes []Hash) ([]int32, []uint64, error) {
 			return 0
 		}
 	})
+
+	// ponytail: H2 prefetch experiment. Sorted order is the order the fan-out will
+	// read in, so start those misses now; UTREEXO_PREFETCH keeps the same binary
+	// A/B-comparable. Remove with the rest of the H2 code if the bench says no.
+	if os.Getenv("UTREEXO_PREFETCH") != "" {
+		if pf, ok := f.positionMap.(interface{ Prefetch(hash [32]byte) }); ok {
+			for _, oi := range order {
+				pf.Prefetch(delHashes[oi])
+			}
+		}
+	}
 
 	if nDels < minParallelSize {
 		for _, oi := range order {

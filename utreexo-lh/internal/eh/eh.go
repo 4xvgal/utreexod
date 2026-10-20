@@ -83,6 +83,11 @@ type EHMap struct {
 	placeFull  uint64
 	statEvery  uint64
 	statOn     bool
+
+	// ponytail: prefetch experiment (H2). lastPrefetch dedupes the FADV_WILLNEED
+	// calls for hashes that land on the same page; only the prefetch path touches
+	// it, and that path runs before the parallel Get fan-out.
+	lastPrefetch int64
 }
 
 // NewEHMap creates a fresh map. load is the target occupancy used by Presize
@@ -374,6 +379,25 @@ func (m *EHMap) Presize(n uint64) error {
 // raw access (read via mmap, write via pwrite)
 // ---------------------------------------------------------------------------
 
+// Prefetch asks the kernel to start reading the bucket backing this hash.
+//
+// Reads go through a read-only MAP_SHARED mmap, so a miss on a multi-GB map is
+// a synchronous major fault. Calling this for a batch (in the order the caller
+// intends to look the hashes up) lets the kernel pipeline the reads instead of
+// stalling on each fault. Hashes that land on the same 4 KiB page cost one call.
+func (m *EHMap) Prefetch(hash [32]byte) {
+	if m.ctrlFile == nil {
+		return
+	}
+	h1, _ := splitHash(hash)
+	page := m.bucketOff(m.bucketFor(h1)) &^ 4095
+	if page == m.lastPrefetch {
+		return
+	}
+	m.lastPrefetch = page
+	adviseWillNeed(m.ctrlFile, page, 4096)
+}
+
 func (m *EHMap) bucketOff(b uint64) int64 { return int64(b * m.bucketSize()) }
 
 func (m *EHMap) ctrl(b uint64) []byte {
@@ -625,6 +649,36 @@ func (m *EHMap) PlaceFull() uint64  { return m.placeFull }
 func (m *EHMap) DropCache() {
 	adviseDontNeed(m.ctrlFile)
 	adviseDontNeed(m.dirFile)
+}
+
+// ResetCache unmaps the ctrl file, drops its page cache, and maps it again.
+//
+// FADV_DONTNEED alone does nothing while the file is mapped, so a bench that
+// wants every pass to start cold (the only regime where read order matters)
+// must unmap first. Measurement only: dirMM stays mapped, and the header must
+// already be written since the remap rereads the file size.
+func (m *EHMap) ResetCache() error {
+	if m.ctrlMM == nil {
+		return nil
+	}
+	size := len(m.ctrlMM)
+	syscall.Munmap(m.ctrlMM)
+	m.ctrlMM = nil
+	// Sync first: FADV_DONTNEED may drop pages that still hold unflushed
+	// writes, which silently loses entries the bench restored.
+	if err := m.ctrlFile.Sync(); err != nil {
+		return err
+	}
+	if os.Getenv("EH_RESET_NODROP") == "" {
+		adviseDontNeed(m.ctrlFile)
+	}
+
+	mm, err := syscall.Mmap(int(m.ctrlFile.Fd()), 0, size, syscall.PROT_READ, syscall.MAP_SHARED)
+	if err != nil {
+		return err
+	}
+	m.ctrlMM = mm
+	return nil
 }
 
 func (m *EHMap) Close() error {

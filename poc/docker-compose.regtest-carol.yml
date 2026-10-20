@@ -1,0 +1,30 @@
+# Unpruned poc utreexod ("carol") serving full blocks + utreexo proofs, so an
+# unmodified upstream utreexod v0.6.0 ("bob") can do a from-genesis IBD.
+# Origin 0.6.0 rejects non-utreexo peers outright, so it cannot take blocks
+# from bitcoind; a poc node with --flatutreexoproofindex has NoUtreexo=true
+# and can sync from bitcoind while serving proofs.
+services:
+  carol:
+    image: cw-utreexod-undoprune:poc
+    container_name: cw_utreexod_carol
+    network_mode: "service:bitcoind"
+    depends_on:
+      bitcoind:
+        condition: service_healthy
+    command:
+      - --regtest
+      - --datadir=/data
+      - --rpcuser=coconut
+      - --rpcpass=coconut
+      - --rpclisten=0.0.0.0:18338
+      - --prune=0
+      - --flatutreexoproofindex
+      - --listen=0.0.0.0:18337
+      - --connect=127.0.0.1:18444
+    volumes:
+      - utreexod_carol_data:/data
+    stop_grace_period: 2m
+
+volumes:
+  utreexod_carol_data:
+    name: cw_utreexod_carol_data

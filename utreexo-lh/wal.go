@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"os"
+	"time"
 )
 
 // wal coordinates crash-safe writes across cachedRWS instances and a
@@ -178,9 +180,19 @@ func (w *wal) Close() {
 // Flush atomically commits all cached writes through the journal.
 // The bestHash is written to metaFile (file index 2) at offset 64.
 func (w *wal) Flush(bestHash [32]byte) error {
+	// ponytail: WALFLUSH phase timing + payload bytes (measurement only).
+	walStat := os.Getenv("UTREEXO_WALSTAT") != ""
+	var t0, t1, t2, t3, t4 time.Time
+	if walStat {
+		t0 = time.Now()
+	}
+
 	// Serialize entries directly from caches to avoid intermediate allocations.
 	entriesBuf := w.serializeEntries(bestHash)
 	totalLen := uint64(len(entriesBuf))
+	if walStat {
+		t1 = time.Now()
+	}
 
 	// Build header.
 	var header [journalHeaderSize]byte
@@ -215,10 +227,16 @@ func (w *wal) Flush(bestHash [32]byte) error {
 	if err := syncFile(w.journal); err != nil {
 		return fmt.Errorf("wal journal sync: %w", err)
 	}
+	if walStat {
+		t2 = time.Now()
+	}
 
 	// Apply directly from caches + bitmap to underlying files.
 	if err := w.applyFromCaches(bestHash); err != nil {
 		return fmt.Errorf("wal apply: %w", err)
+	}
+	if walStat {
+		t3 = time.Now()
 	}
 
 	// The bestHash write above went directly to the underlying metaFile,
@@ -235,6 +253,13 @@ func (w *wal) Flush(bestHash [32]byte) error {
 	}
 	if err := syncFile(w.bitmapFile); err != nil {
 		return fmt.Errorf("wal sync bitmap file: %w", err)
+	}
+	if walStat {
+		t4 = time.Now()
+		fmt.Fprintf(os.Stderr, "WALFLUSH bytes=%d ser=%v jwrite=%v jsync=%v apply=%v fsync=%v total=%v\n",
+			totalLen, t1.Sub(t0).Round(time.Millisecond), t2.Sub(t1).Round(time.Millisecond),
+			t3.Sub(t2).Round(time.Millisecond), t4.Sub(t3).Round(time.Millisecond),
+			time.Since(t4).Round(time.Millisecond), time.Since(t0).Round(time.Millisecond))
 	}
 
 	// Clear journal.
