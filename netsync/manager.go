@@ -291,9 +291,8 @@ func (sm *SyncManager) startSync() {
 		return
 	}
 
-	// If the current node is dependent on the utreexoView, (aka a compact state node)
-	// then only connect to other utreexo nodes.
-	utreexoViewActive := sm.chain.IsUtreexoViewActive()
+	// lab: block-serving peers don't have to be utreexo nodes. Proofs are
+	// fetched from a utreexo peer separately (see pickProofPeer).
 
 	best := sm.chain.BestSnapshot()
 	_, bestHeaderHeight := sm.chain.BestHeader()
@@ -308,10 +307,8 @@ func (sm *SyncManager) startSync() {
 			continue
 		}
 
-		if utreexoViewActive && !peer.IsUtreexoEnabled() {
-			log.Debugf("peer %v not utreexo enabled, skipping", peer)
-			continue
-		}
+		// lab: block-serving peers don't have to be utreexo nodes. Proofs are
+		// fetched from a utreexo peer separately (see pickProofPeer).
 
 		// Figure out what the peer is based on the best block.
 		switch {
@@ -355,10 +352,11 @@ func (sm *SyncManager) startSync() {
 
 	// This means that there's extra headers that we need to download.
 	if len(higherHeaderPeers) > 0 {
-		var bestPeer *peerpkg.Peer
-		switch {
-		case len(higherHeaderPeers) > 0:
-			bestPeer = higherHeaderPeers[rand.Intn(len(higherHeaderPeers))]
+		bestPeer := pickBlockPeer(higherHeaderPeers)
+		if bestPeer == nil {
+			// lab: only proof-only bridges connected; wait for a block peer.
+			log.Debugf("no block-serving peer connected yet")
+			return
 		}
 
 		sm.syncPeer = bestPeer
@@ -391,10 +389,10 @@ func (sm *SyncManager) startSync() {
 	var bestPeer *peerpkg.Peer
 	switch {
 	case len(higherPeers) > 0:
-		bestPeer = higherPeers[rand.Intn(len(higherPeers))]
+		bestPeer = pickBlockPeer(higherPeers)
 
 	case len(equalPeers) > 0:
-		bestPeer = equalPeers[rand.Intn(len(equalPeers))]
+		bestPeer = pickBlockPeer(equalPeers)
 	}
 
 	// Start syncing from the best peer if one was selected.
@@ -423,6 +421,63 @@ func (sm *SyncManager) startSync() {
 	} else {
 		log.Warnf("No sync peer candidates available")
 	}
+}
+
+// pickBlockPeer returns a peer to sync blocks from, preferring peers that
+// advertise full blocks (bitcoind or a utreexo archive node) over proof-only
+// bridges that can't serve historical blocks. lab: florestad-style split, the
+// block peer and the proof peer may differ.
+func pickBlockPeer(peers []*peerpkg.Peer) *peerpkg.Peer {
+	if len(peers) == 0 {
+		return nil
+	}
+
+	full := make([]*peerpkg.Peer, 0, len(peers))
+	limited := make([]*peerpkg.Peer, 0, len(peers))
+	for _, p := range peers {
+		svc := p.Services()
+		switch {
+		case svc.HasFlag(wire.SFNodeNetwork):
+			full = append(full, p)
+		case svc.HasFlag(wire.SFNodeNetworkLimited):
+			limited = append(limited, p)
+		}
+	}
+
+	switch {
+	case len(full) > 0:
+		return full[rand.Intn(len(full))]
+	case len(limited) > 0:
+		return limited[rand.Intn(len(limited))]
+	}
+	return peers[rand.Intn(len(peers))]
+}
+
+// servesBlocks reports whether the peer can serve full blocks (bitcoind or a
+// full utreexo node). Proof-only bridges can't.
+func servesBlocks(p *peerpkg.Peer) bool {
+	svc := p.Services()
+	return svc.HasFlag(wire.SFNodeNetwork) || svc.HasFlag(wire.SFNodeNetworkLimited)
+}
+
+// pickProofPeer returns a peer that can serve utreexo proofs. The block peer
+// may be a plain bitcoind, so fall back to any connected utreexo peer (the
+// pruned proof-only bridge). lab: florestad-style split.
+func (sm *SyncManager) pickProofPeer() *peerpkg.Peer {
+	if sm.syncPeer != nil && sm.syncPeer.IsUtreexoEnabled() {
+		return sm.syncPeer
+	}
+
+	var best *peerpkg.Peer
+	for p := range sm.peerStates {
+		if !p.Connected() || !p.IsUtreexoEnabled() {
+			continue
+		}
+		if best == nil || p.LastBlock() > best.LastBlock() {
+			best = p
+		}
+	}
+	return best
 }
 
 // isSyncCandidate returns whether or not the peer is a candidate to consider
@@ -461,13 +516,9 @@ func (sm *SyncManager) isSyncCandidate(peer *peerpkg.Peer) bool {
 		return false
 	}
 
-	// If the node is dependent on the utreexoViewpoint (aka the node
-	// is a compact state node), then the peer must have utreexo services
-	// active.
-	utreexoViewActive := sm.chain.IsUtreexoViewActive()
-	if utreexoViewActive && !peer.IsUtreexoEnabled() {
-		return false
-	}
+	// lab: allow non-utreexo sync peers; blocks from bitcoind, proofs from a
+	// utreexo peer (florestad-style split). pickBlockPeer prefers peers that
+	// serve full blocks so a proof-only bridge isn't picked for block sync.
 
 	var (
 		nodeServices = peer.Services()
@@ -528,8 +579,45 @@ func (sm *SyncManager) handleNewPeerMsg(peer *peerpkg.Peer) {
 	}
 
 	// Start syncing by choosing the best candidate if needed.
-	if isSyncCandidate && sm.syncPeer == nil {
+	switch {
+	case isSyncCandidate && sm.syncPeer == nil:
 		sm.startSync()
+
+	case sm.syncPeer != nil && sm.chain.IsUtreexoViewActive() &&
+		peer.IsUtreexoEnabled():
+		// lab: a proof peer just appeared. Resume the block download that
+		// fetchHeaderBlocks skipped because there was no proof source.
+		sm.fetchHeaderBlocks(nil)
+
+	case sm.syncPeer != nil && servesBlocks(peer) && !servesBlocks(sm.syncPeer):
+		// lab: a block-serving peer appeared while syncing off a proof-only
+		// bridge. Switch to it; blocks come from bitcoind or a full node.
+		sm.syncPeer = nil
+		sm.startSync()
+	}
+}
+
+// retryMissingProofs re-requests proofs for queued blocks that still don't have
+// one. lab: a request can race the bridge's index catch-up and is dropped
+// silently, so retry on every stall sample until the proof shows up.
+func (sm *SyncManager) retryMissingProofs() {
+	proofPeer := sm.pickProofPeer()
+	if proofPeer == nil {
+		return
+	}
+
+	state := sm.peerStates[proofPeer]
+	for hash := range sm.queuedBlocks {
+		if _, ok := sm.queuedUtreexoProofs[hash]; ok {
+			continue
+		}
+
+		state.requestedUtreexoProofs[hash] = struct{}{}
+		msg := wire.MsgGetUtreexoProof{BlockHash: hash}
+		msg.SetTargetRequestBit()
+		msg.SetProofHashRequestBit()
+		msg.SetLeafDataRequestBit()
+		proofPeer.QueueMessage(&msg, nil)
 	}
 }
 
@@ -541,6 +629,8 @@ func (sm *SyncManager) handleStallSample() {
 	if atomic.LoadInt32(&sm.shutdown) != 0 {
 		return
 	}
+
+	sm.retryMissingProofs()
 
 	// If we don't have an active sync peer, exit early.
 	if sm.syncPeer == nil {
@@ -820,6 +910,16 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockMsg) {
 		// We need the utreexo proof to be able to verify the block.
 		utreexoProofMsg, found := sm.queuedUtreexoProofs[*bmsg.block.Hash()]
 		if !found {
+			// lab: the block may come from a non-utreexo peer (bitcoind), and
+			// the earlier request may have raced the bridge's index catch-up.
+			// Ask a utreexo peer again when the block arrives without a proof.
+			if proofPeer := sm.pickProofPeer(); proofPeer != nil {
+				msg := wire.MsgGetUtreexoProof{BlockHash: *blockHash}
+				msg.SetTargetRequestBit()
+				msg.SetProofHashRequestBit()
+				msg.SetLeafDataRequestBit()
+				proofPeer.QueueMessage(&msg, nil)
+			}
 			log.Warnf("got block %v but don't have the associated "+
 				"utreexo proof", bmsg.block.Hash())
 			sm.queuedBlocks[*blockHash] = bmsg
@@ -885,6 +985,25 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockMsg) {
 		code, reason := mempool.ErrToRejectErr(err)
 		peer.PushRejectMsg(wire.CmdBlock, code, reason, blockHash, false)
 		return
+	}
+
+	// lab: a child whose proof arrived before its parent was queued as out of
+	// order. Now that the tip advanced, re-dispatch queued children of it.
+	if !isOrphan && sm.chain.IsUtreexoViewActive() {
+		best := sm.chain.BestSnapshot()
+		var children []*blockMsg
+		for hash, child := range sm.queuedBlocks {
+			if !child.block.MsgBlock().Header.PrevBlock.IsEqual(&best.Hash) {
+				continue
+			}
+			delete(sm.queuedBlocks, hash)
+			children = append(children, child)
+		}
+		// lab: dispatch directly; self-sending on msgChan can deadlock when
+		// the proof flood has filled it.
+		for _, child := range children {
+			sm.handleBlockMsg(child)
+		}
 	}
 
 	// Meta-data about the new block this peer is reporting. We use this
@@ -1078,6 +1197,18 @@ func (sm *SyncManager) fetchHeaderBlocks(peer *peerpkg.Peer) {
 		reqPeer = peer
 	}
 
+	// lab: never pull blocks from a proof-only bridge (utreexo service but no
+	// block service) while a block-serving peer is available, and wait for one
+	// if there is none (the bridge only keeps the last 288 blocks).
+	if reqPeer.IsUtreexoEnabled() && !servesBlocks(reqPeer) {
+		if sm.syncPeer != nil && sm.syncPeer != reqPeer && servesBlocks(sm.syncPeer) {
+			reqPeer = sm.syncPeer
+		} else {
+			log.Debugf("no block-serving peer for %s yet", reqPeer.Addr())
+			return
+		}
+	}
+
 	peerState, exists := sm.peerStates[reqPeer]
 	if !exists {
 		log.Warnf("Don't have peer state for request peer %s", reqPeer.String())
@@ -1181,7 +1312,15 @@ func (sm *SyncManager) fetchHeaderBlocks(peer *peerpkg.Peer) {
 			// Immediately queue the utreexo proof for this block if we're a
 			// utreexo node.
 			if sm.chain.IsUtreexoViewActive() {
-				peerState.requestedUtreexoProofs[*hash] = struct{}{}
+				// lab: blocks may come from a non-utreexo peer (bitcoind),
+				// so ask a utreexo peer for the proof instead of reqPeer.
+				proofPeer := reqPeer
+				if !reqPeer.IsUtreexoEnabled() {
+					if picked := sm.pickProofPeer(); picked != nil {
+						proofPeer = picked
+					}
+				}
+				sm.peerStates[proofPeer].requestedUtreexoProofs[*hash] = struct{}{}
 
 				// If we still have ttls left to download, then we only need
 				// the utreexo proof data since we're in swiftsync ibd.
@@ -1196,7 +1335,7 @@ func (sm *SyncManager) fetchHeaderBlocks(peer *peerpkg.Peer) {
 					msg.SetLeafDataRequestBit()
 				}
 
-				reqPeer.QueueMessage(&msg, nil)
+				proofPeer.QueueMessage(&msg, nil)
 			}
 		}
 
@@ -1324,10 +1463,12 @@ func (sm *SyncManager) handleUtreexoProofMsg(hmsg *utreexoProofMsg) {
 
 	sm.queuedUtreexoProofs[blockHash] = hmsg
 
-	bmsg, haveBlock := sm.queuedBlocks[blockHash]
-	if haveBlock {
-		bmsg.reply = make(chan struct{}, 1)
-		sm.msgChan <- bmsg
+	if bmsg, haveBlock := sm.queuedBlocks[blockHash]; haveBlock {
+		// lab: dispatch directly instead of self-sending on msgChan. We're
+		// already in the block handler goroutine, and self-sending deadlocks
+		// when a proof flood fills msgChan while we re-queue a block.
+		delete(sm.queuedBlocks, blockHash)
+		sm.handleBlockMsg(bmsg)
 	}
 }
 

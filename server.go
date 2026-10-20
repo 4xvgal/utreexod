@@ -522,20 +522,9 @@ func (sp *serverPeer) OnVersion(_ *peer.Peer, msg *wire.MsgVersion) *wire.MsgRej
 		return nil
 	}
 
-	// Also reject outbound peers that aren't utreexo nodes if we're a utreexo csn.
-	var wantServices wire.ServiceFlag
-	if sp.server.chain.IsUtreexoViewActive() {
-		wantServices |= wire.SFNodeUtreexo
-	}
-	if !isInbound && !hasServices(msg.Services, wantServices) {
-		missingServices := wantServices & ^msg.Services
-		srvrLog.Debugf("Rejecting peer %s with services %v due to not "+
-			"providing desired services %v", sp.Peer, msg.Services,
-			missingServices)
-		reason := fmt.Sprintf("required services %#x not offered",
-			uint64(missingServices))
-		return wire.NewMsgReject(msg.Command(), wire.RejectNonstandard, reason)
-	}
+	// lab: don't require SFNodeUtreexo from block-serving peers (bitcoind).
+	// The sync manager fetches proofs from a utreexo peer separately, the way
+	// florestad does, so blocks and proofs may come from different peers.
 
 	if !cfg.SimNet && !isInbound {
 		// After soft-fork activation, only make outbound
@@ -556,13 +545,6 @@ func (sp *serverPeer) OnVersion(_ *peer.Peer, msg *wire.MsgVersion) *wire.MsgRej
 			return nil
 		}
 
-		// Disconnect peers that aren't utreexo nodes if we're a csn.
-		if sp.server.chain.IsUtreexoViewActive() && !sp.IsUtreexoEnabled() {
-			peerLog.Infof("Disconnecting non-utreexo peer %v, as we're a utreexo "+
-				"node", sp)
-			sp.Disconnect()
-			return nil
-		}
 	}
 
 	// Add the remote peer time as a sample for creating an offset against

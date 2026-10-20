@@ -1,0 +1,11 @@
+FROM golang:1.25-bookworm AS builder
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
+COPY . /src
+WORKDIR /src
+RUN go build -o /out/utreexod .
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /out/utreexod /usr/local/bin/utreexod
+VOLUME ["/data"]
+ENTRYPOINT ["utreexod"]
