@@ -1,0 +1,62 @@
+# Mainnet A/B measurement stack for candidate A (dense WAL mmap cache).
+#
+# Fresh mainnet volume (the old utreexod-mainnet-v3 was deleted), IBD limited
+# with --ibdmaxheight so the state stops at a fixed height. A/B is then done by
+# restarting the same volume with/without UTREEXO_WAL_DENSE=1: on restart the
+# flat utreexo index is replayed from block 1, which is the window where the
+# WAL cache fills its budget (that is where the 100 B/entry waste lives).
+#
+#   docker build -f Dockerfile.lab -t cw-utreexod-a-dense:poc .
+#   docker compose -p a-dense -f poc/docker-compose.a-dense-mainnet.yml up -d
+#   WAL_DENSE=1 docker compose -p a-dense -f poc/docker-compose.a-dense-mainnet.yml up -d
+#
+# Stop gracefully only (10m grace lets the flat forest + proof index flush).
+services:
+  utreexod:
+    image: cw-utreexod-a-dense:poc
+    container_name: cw_utreexod_a_dense
+    environment:
+      UTREEXOD_POSMAP: "eh"
+      # Measurement instrumentation (env-gated in the lab build).
+      UTREEXO_WALSTAT: "1"
+      # Dense (entry-indexed) WAL cache switch: default off, same binary A/B.
+      UTREEXO_WAL_DENSE: "${WAL_DENSE:-}"
+      # Measurement-only: widen the periodic flush so the WAL cache window is
+      # bounded by --utreexoproofindexmaxmemory (1 GiB = 33.5M entries) instead
+      # of by 5 minutes of writes. Empty keeps the default 5m.
+      UTREEXOD_UTXO_FLUSH_INTERVAL: "${FLUSH_INTERVAL:-}"
+    command:
+      - --datadir=/data
+      - --rpcuser=coconut
+      - --rpcpass=coconut
+      - --rpclisten=0.0.0.0:8334
+      - --flatutreexoproofindex
+      - --proofonly
+      - --uacomment=a-dense
+      # Keep the UTXO cache from forcing the utreexo flush: the A/B window we
+      # want is bounded by --utreexoproofindexmaxmemory (1 GiB = 33.5M entries),
+      # which is where the 3.36 GB / 100 B-per-entry anchor was measured. With
+      # 1024 MiB here the UTXO cache flushed every ~29 s at ~5M entries, so the
+      # WAL cache never reached its budget (~600 MB anon instead of 3.36 GB).
+      - --utxocachemaxsize=4096
+      - --utreexoproofindexmaxmemory=1024
+      - --prune=550
+      # Stop connecting blocks above this height (bootstrap stops at 260k,
+      # the A/B phase raises it with IBD_MAX_HEIGHT).
+      - --ibdmaxheight=${IBD_MAX_HEIGHT:-260000}
+      # Local full node that serves the utreexo proof stream.
+      - --connect=${BTC_FULLNODE:-192.168.0.55:8333}
+    volumes:
+      # A/B runs use two copies of the same state so both process the same
+      # block range (VOLUME_NAME picks which copy).
+      - ${VOLUME_NAME:-utreexod-a-dense-mainnet}:/data
+    mem_limit: 11g
+    memswap_limit: 11g
+    stop_grace_period: 10m
+
+volumes:
+  utreexod-a-dense-mainnet:
+    name: utreexod-a-dense-mainnet
+  # Second copy of the same state: A and B each sync the same block range.
+  utreexod-a-dense-mainnet-b:
+    name: utreexod-a-dense-mainnet-b

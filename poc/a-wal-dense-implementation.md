@@ -9,8 +9,9 @@
 `UTREEXO_WAL_DENSE=1`로 켜는 엔트리 번호 주소지정 dense 캐시를 구현했다. 33.5M 엔트리에서
 **48.9 B/entry = 1.53 GiB** (data 32 B + offset 8 B + index ~9 B)로, 실측 앵커
 **100 B/entry = 3.36 GB** 대비 **~1.7 GB 회수**가 예상된다. 테스트(양방향 전체 스위트,
-`-race`, 33.5M bigmem), regtest(A/B, 재기동 재사용, reorg) 모두 통과. **mainnet A/B는
-이 호스트에서 실행 불가**(볼륨 부재, §5)라 채택 판정은 잠정이다.
+`-race`, 33.5M bigmem), regtest(A/B, 재기동 재사용, reorg) 모두 통과. 메인넷 A/B도 실행했다
+(§6): 동일 write 집합에서 **anon −0.5~1.0 GB / page cache +0.42 GiB**. 단 창이 5M 엔트리로
+묶여(=`--ibdmaxheight=306k` 상태의 한계) 앵커 스케일 −1.7 GB는 modern 높이에서 재측정 필요.
 
 ## 1. 게이트 (3.1) — mainnet bytes/entry
 
@@ -130,32 +131,76 @@ dense 목표(32 B/entry) + offset 8 B + index ~9 B = 48.9 B/entry. 회수량 =
 - RSS(컨테이너 규모): A 264 MB / B 274–309 MB (HWM 326 / 439 MB) — 예상대로 0.2M 규모에서는
   차이 없음(둘 다 ~1.0x). 이 스택으로 이득을 증명하지 않는다.
 
-## 6. mainnet A/B (3.6) — **실행 불가**
+## 6. mainnet A/B (3.6) — 실행함 (스케일 제한)
 
-이 OrbStack 컨텍스트에 `utreexod-mainnet-v3` 볼륨과 `cw_utreexod_mainnet` 컨테이너가 없다
-(§1). 규칙상 새 볼륨/제네시스 IBD로 대체하지 않았다. 볼륨이 있는 호스트에서 아래 절차/판정만
-그대로 쓰면 된다.
+### 6.1 환경 (새로 구성)
 
-```
-A: (dense off) 30–40분 → height별 도달시간, smaps WAL anon Rss, memory.stat, pgscan/pgsteal,
-   majflt/s, blk/s, flush 주기 기록 → docker compose stop (graceful)
-B: UTREEXO_WAL_DENSE=1 같은 볼륨/같은 플래그로 재기동 → 같은 구간 도달시간 비교 (필요시 A/B/B/A)
-롤백: UTREEXO_WAL_DENSE 미설정 재시작 (포맷 변화 없음)
-판정: anon −1.5 GB 이상 && blk/s −5% 이내(또는 상승) → 채택
-```
+옛 `utreexod-mainnet-v3` 볼륨은 삭제되어 새로 만들었다(사용자 승인). 볼륨/컨테이너/문서:
 
-예상 표(빈 칸은 위 실행에서 채울 것):
+- 볼륨 `utreexod-a-dense-mainnet`(+ 두 번째 복사본 `utreexod-a-dense-mainnet-b`,
+  다른 에이전트용 클론 `utreexod-mainnet-clone-306k`) — **삭제 금지**, `poc/a-dense-volumes.md`.
+- 이미지 `cw-utreexod-a-dense:poc` (`Dockerfile.lab`, dense 코드 + FLUSHSTAT/WALSTAT).
+- compose `poc/docker-compose.a-dense-mainnet.yml`: `--proofonly --flatutreexoproofindex
+  --prune=550 --utreexoproofindexmaxmemory=1024 --utxocachemaxsize=4096 --ibdmaxheight=<H>`,
+  posmap `eh`, `mem_limit 11g`, `--connect=192.168.0.55:8333`(utreexo proof 브리지).
+- 샘플러 `poc/a-dense-sample.sh` → `poc/a-dense-ab-off.csv`, `poc/a-dense-ab-on.csv`.
 
-| run | anon Rss | file Rss | majflt/s | blk/s | flush 주기 | 비고 |
-|---|---:|---:|---:|---:|---|---|
-| A (off) | (3.36 GB 기준선) | | | | ~5 min | 100 B/entry |
-| B (on) | **~1.6 GB 예상** | | | | ~3.3 min | 48.9 B/entry 실측(33.5M) |
+**높이 제한 IBD는 가능하다**: `--ibdmaxheight=N`(이미 `config.go`/`netsync/manager.go`에 있음,
+lab proof-only 브리지 커밋에서 도입)이 N 초과 블록 연결을 중단한다. 실측: 0→260,000 까지
+약 30분, 이어서 306,507까지 진행(`ibdmaxheight`로 정지, 이후 헤더만 받음).
+
+### 6.2 앵커 창을 못 만든 문제 (중요)
+
+| 조건 | WAL flush 창 엔트리 | 페이로드 |
+|---|---:|---:|
+| `--utxocachemaxsize=1024` | ~4.2 M | 190 MB |
+| `--utxocachemaxsize=4096` | ~5.2-5.6 M | 234-251 MB |
+| 앵커(=1 GiB WAL 예산 바인딩) | **33.5 M** | ~1.5 GB |
+
+원인: 창은 WAL 예산이 아니라 **UTXO 캐시 flush**가 결정한다(utxo 캐시가 ~1.6 GiB/약 100만
+엔트리에서 flush). 2013-2014 블록은 블록당 고유 오프셋이 ~200-500개라 5분(주기 flush) 동안
+33.5M에 도달하지 못한다. 계측용 `UTREEXOD_UTXO_FLUSH_INTERVAL`(주기 5m→N) override를
+추가했지만 창을 키우는 트리거가 시간이 아니라 UTXO 캐시 크기여서 효과 없음(코드는 유지).
+→ 앵커 스케일은 modern 높이(≥600k) 블록 또는 `--prune=0` replay가 필요하다.
+
+### 6.3 A/B 결과 (동일 블록 구간, 동일 플래그, dense off vs on)
+
+같은 상태(296,507)에서 복제한 두 볼륨으로 **양쪽 모두 296,507→306,469**를 처리했다.
+flush 페이로드가 양쪽에서 같은 값(예: `WALFLUSH bytes=251502986`)으로 나와 **동일한 write
+집합을 처리했음**이 확인된다.
+
+| 지표 (중앙값, 높이 298k-306k) | A (dense off) | B (dense on) | 차이 |
+|---|---:|---:|---|
+| cgroup anon | 3.81 GiB | 3.38 GiB | **−0.43 GiB** |
+| cgroup file (page cache) | 1.89 GiB | 2.31 GiB | **+0.42 GiB** |
+| VmRSS | 5.83 GiB | 5.20 GiB | −0.63 GiB |
+| majflt/s | 842 | 830 | ±0 (이 규모에선 압력 없음) |
+
+높이 매칭 delta(anon, MB): 298k 724 / 299k 987 / 300k 693 / 301k 794 / 302k 998 /
+303k 524 / 304k 891 / 305k 686 / 306k 1001 → **중앙값 724 MB, 범위 0.5–1.0 GB**.
+
+- 예상 모델(창 엔트리 × (100−48.9) B ≈ 284 MB)보다 큰데, sparse store가 추가로 **bitmap
+  (1 bit/slot, 4 GiB 영역)** 페이지를 창마다 fault-in 하기 때문이다(≈ +0.5 GB). dense에는
+  bitmap이 없다.
+- flush 소요 시간은 이번 A/B에서 판정 근거로 쓰지 않았다: B run 중에 볼륨 클론 복사가 겹쳐
+  `jsync`가 4 s → 10-11 s로 오염됐다(순수 dense 영향 아님).
+
+### 6.4 판정
+
+- **방향·메커니즘 확인**: 같은 write 집합에서 anon −0.5~1.0 GB, 그만큼 page cache 증가,
+  flush 횟수/페이로드 동일(추가 flush 비용 없음). 이 규모에서는 majflt 변화 없음.
+- **앵커(−1.5 GB) 검증은 미완**: 창이 33.5M 엔트리여야 하고, 이 데이터(≤306k 높이)로는
+  재현 불가. modern 높이에서 같은 A/B를 반복하면 `(100−48.9) B × 33.5M ≈ 1.7 GB`가 기대된다.
+- 회수분은 그대로 page cache로 갔고(`file` +0.42 GiB), 압력이 걸리는 규모(mainnet 10 GB
+  cgroup, forest 17 GB)에서는 이 차이가 majflt/blk-s로 나타날 것으로 본다.
 
 ## 7. 판정
 
-- **구현 채택 (잠정)**. 근거: (a) 33.5M 엔트리에서 48.9 B/entry 실측 → 회수 ~1.7 GB,
+- **구현 채택 (잠정)**. 근거: (a) 33.5M 엔트리에서 48.9 B/entry 실측, 실 mainnet A/B에서
+  동일 write 집합에 anon −0.5~1.0 GB / page cache +0.42 GiB,
   (b) 기능 동일성(off/on 커밋 바이트 동일), (c) 전체 스위트 양방향 + `-race` + crash/replay 통과,
-  (d) regtest A/B·재기동·reorg 무에러. 남은 조건은 §6 mainnet A/B(볼륨 있는 호스트).
+  (d) regtest A/B·재기동·reorg 무에러. 남은 조건: §6.2의 앵커 창(33.5M 엔트리)을 만드는
+  modern 높이 A/B — 이 박스에서는 260k-306k 상태로 창이 5M에 묶였다.
 - 리스크/한계: flush 빈도 +50%(고정비 ~50 ms/회), `ForEach` 방문 순서가 sparse와 다름
   (journal/apply는 순서 무관), dense 캐시는 offset을 정확 키로 취급(비정렬 offset은 miss —
   `cachedRWS`는 정렬 레코드만 쓴다).
@@ -182,7 +227,14 @@ WAL_DENSE=1 docker compose -p flushstat -f poc/docker-compose.regtest-flushstat.
 python3 poc/flushstat-mine.py -n 120 -o 2000
 ```
 
-## 9. 이번 세션에서 만난 환경 문제
+## 9. 이번 세션에서 추가한 계측 (lab 브랜치, 기본값 불변)
+
+- `blockchain/utxocache.go`: `UtxoFlushPeriodicInterval` const → var (측정 빌드가 주기를 바꿀 수
+  있게), `blockchain/indexers/utreexobackend.go` init에서 `UTREEXOD_UTXO_FLUSH_INTERVAL` 파싱.
+- `poc/docker-compose.a-dense-mainnet.yml`, `poc/a-dense-sample.sh`, `poc/a-dense-volumes.md`,
+  A/B 원자료 `poc/a-dense-ab-off.csv` / `poc/a-dense-ab-on.csv`.
+
+## 10. 이번 세션에서 만난 환경 문제
 
 `utreexo-lh/internal/eh/load_sweep_test.go`(untracked, 세션 중 외부에서 생성됨, 이 작업과
 무관)가 `off / m.bucketSize()` (int64/uint64) 타입 오류로 `./internal/eh` 빌드를 깨뜨린다.
